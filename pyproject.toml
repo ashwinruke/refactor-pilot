@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "refactor-pilot"
+version = "0.0.1"
+description = "LSP-powered agent that modernizes legacy C++ (C++11/14 -> C++20) with verified, reversible change-sets"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+refactor-pilot = "refactor_pilot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["toolchain: needs cmake, ninja, clang++ and clang-tidy on PATH"]

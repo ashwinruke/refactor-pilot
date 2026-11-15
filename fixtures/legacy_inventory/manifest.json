@@ -1,0 +1,43 @@
+{
+  "name": "legacy_inventory",
+  "description": "Known legacy constructs planted in the fixture. An item is resolved when legacy_pattern no longer matches the file (comments stripped).",
+  "items": [
+    {"id": "r1-null-item", "recipe": "R1", "file": "src/item.cpp", "legacy_pattern": "\\bNULL\\b", "description": "NULL instead of nullptr"},
+    {"id": "r1-null-warehouse", "recipe": "R1", "file": "src/warehouse.cpp", "legacy_pattern": "\\bNULL\\b", "description": "NULL instead of nullptr"},
+    {"id": "r1-null-logger", "recipe": "R1", "file": "src/logger.cpp", "legacy_pattern": "\\bNULL\\b", "description": "NULL instead of nullptr"},
+    {"id": "r1-override", "recipe": "R1", "file": "include/inventory/item.h", "legacy_pattern": "virtual\\s+(Category|double|std::string)\\s+\\w+\\(\\)\\s+const;[\\s\\S]*class PerishableItem[\\s\\S]*virtual\\s+(Category|double|std::string)\\s+\\w+\\(\\)\\s+const;", "description": "overriding virtuals in PerishableItem lack override"},
+    {"id": "r1-typedef", "recipe": "R1", "file": "include/inventory/item.h", "legacy_pattern": "\\btypedef\\b", "description": "typedef instead of using"},
+    {"id": "r1-iterator-loops", "recipe": "R1", "file": "src/warehouse.cpp", "legacy_pattern": "::(const_)?iterator\\s+it\\s*=", "description": "explicit iterator loops instead of range-for"},
+    {"id": "r1-index-loop", "recipe": "R1", "file": "src/warehouse.cpp", "legacy_pattern": "for \\(int i = 0; i < items_\\.size\\(\\)", "description": "signed/unsigned index loop (also a -Wsign-compare warning)"},
+    {"id": "r1-delete-copy-warehouse", "recipe": "R1", "file": "include/inventory/warehouse.h", "legacy_pattern": "Warehouse\\(const Warehouse&\\);", "description": "private undefined copy constructor instead of = delete"},
+    {"id": "r1-delete-copy-logger", "recipe": "R1", "file": "include/inventory/logger.h", "legacy_pattern": "Logger\\(const Logger&\\);", "description": "private undefined copy constructor instead of = delete"},
+    {"id": "r1-c-headers", "recipe": "R1", "file": "src/item.cpp", "legacy_pattern": "#include <stdio\\.h>", "description": "C header instead of <cstdio>"},
+    {"id": "r1-c-cast", "recipe": "R1", "file": "src/item.cpp", "legacy_pattern": "\\(double\\)\\s*\\w", "description": "C-style cast"},
+
+    {"id": "r2-owning-vector", "recipe": "R2", "file": "include/inventory/warehouse.h", "legacy_pattern": "std::vector<Item\\*>\\s+items_", "description": "vector of raw owning pointers; should own via unique_ptr"},
+    {"id": "r2-manual-delete", "recipe": "R2", "file": "src/warehouse.cpp", "legacy_pattern": "\\bdelete\\b", "description": "manual delete in destructor, remove and duplicate-rejection path"},
+    {"id": "r2-add-item-ownership", "recipe": "R2", "file": "include/inventory/warehouse.h", "legacy_pattern": "Item\\*\\s+add_item\\(Item\\*", "description": "ownership transfer in via raw pointer"},
+    {"id": "r2-release-ownership", "recipe": "R2", "file": "include/inventory/warehouse.h", "legacy_pattern": "Item\\*\\s+release\\(", "description": "ownership transfer out via raw pointer"},
+    {"id": "r2-factory", "recipe": "R2", "file": "include/inventory/item.h", "legacy_pattern": "Item\\*\\s+create_item\\(", "description": "factory returns a raw owning pointer"},
+    {"id": "r2-raw-new", "recipe": "R2", "file": "src/item.cpp", "legacy_pattern": "=\\s*new\\s+\\w+", "description": "raw new in factory instead of make_unique"},
+    {"id": "r2-file-handle", "recipe": "R2", "file": "include/inventory/logger.h", "legacy_pattern": "FILE\\*\\s+file_", "description": "manually closed FILE*; should be RAII (ofstream or unique_ptr with deleter)"},
+    {"id": "r2-manual-lock", "recipe": "R2", "file": "src/logger.cpp", "legacy_pattern": "mutex_\\.(un)?lock\\(\\)", "description": "manual lock/unlock with an early-return path; should be lock_guard/scoped_lock"},
+
+    {"id": "r3-const-macros", "recipe": "R3", "file": "include/inventory/util.h", "legacy_pattern": "#define INVENTORY_MAX_", "description": "constant macros instead of constexpr"},
+    {"id": "r3-function-macros", "recipe": "R3", "file": "include/inventory/util.h", "legacy_pattern": "#define INVENTORY_(SQUARE|MIN)\\(", "description": "function-like macros that evaluate arguments twice"},
+    {"id": "r3-unscoped-enum", "recipe": "R3", "file": "include/inventory/item.h", "legacy_pattern": "\\benum\\s+Category\\b", "description": "unscoped enum with prefixed enumerators instead of enum class"},
+
+    {"id": "r4-enable-if", "recipe": "R4", "file": "include/inventory/util.h", "legacy_pattern": "std::enable_if", "description": "SFINAE overload pair; should be concepts (std::integral / std::floating_point)"},
+
+    {"id": "r5-snprintf", "recipe": "R5", "file": "src/item.cpp", "legacy_pattern": "\\bsnprintf\\(", "description": "fixed buffer + snprintf instead of std::format"},
+    {"id": "r5-pointer-length", "recipe": "R5", "file": "include/inventory/util.h", "legacy_pattern": "const (int|double)\\* data, size_t count", "description": "pointer + length pair instead of std::span"},
+    {"id": "r5-starts-with", "recipe": "R5", "file": "src/util.cpp", "legacy_pattern": "text\\.compare\\(0,", "description": "hand-rolled prefix check instead of starts_with"},
+
+    {"id": "r6-stale-ifdef", "recipe": "R6", "file": "src/pricing.cpp", "legacy_pattern": "INVENTORY_ENABLE_LEGACY_PRICING", "description": "branch behind a compile-time flag no build defines"},
+    {"id": "r6-constant-flag", "recipe": "R6", "file": "src/pricing.cpp", "legacy_pattern": "kUseTieredDiscounts", "description": "runtime flag hard-wired to true with an unreachable else"},
+    {"id": "r6-if-zero", "recipe": "R6", "file": "src/pricing.cpp", "legacy_pattern": "#if 0", "description": "#if 0 block"},
+    {"id": "r6-unused-static", "recipe": "R6", "file": "src/pricing.cpp", "legacy_pattern": "legacy_round_cents", "description": "unused internal-linkage function (tier 1: safe to delete)"},
+    {"id": "r6-unused-include", "recipe": "R6", "file": "src/pricing.cpp", "legacy_pattern": "#include <map>", "description": "unused include"},
+    {"id": "r6-unused-public", "recipe": "R6", "file": "include/inventory/pricing.h", "legacy_pattern": "legacy_flat_tax", "description": "unreferenced function in a public header (tier 2: report, delete only if API changes are allowed)"}
+  ]
+}
