@@ -1,9 +1,11 @@
 """Command line entry point.
 
-Phase 0 commands:
+Commands:
   baseline  build + test the repo as it stands and save a snapshot
   check     rebuild + retest and fail if anything regressed against a snapshot
   score     report how many known legacy constructs from a manifest are gone
+  symbols   list the symbols declared in one file (via clangd)
+  refs      show a symbol's signature, callers and every reference (via clangd)
 """
 
 from __future__ import annotations
@@ -15,6 +17,8 @@ from pathlib import Path
 from . import __version__, baseline
 from .build import BuildConfig, BuildFailed
 from .evalkit import score as scoremod
+from .lsp import LspError
+from .navigator import SymbolNavigator
 from .toolchain import ToolMissing
 
 
@@ -75,6 +79,43 @@ def cmd_score(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_symbols(args: argparse.Namespace) -> int:
+    with SymbolNavigator(BuildConfig(repo=args.repo, work_dir=args.work_dir, compiler=args.compiler)) as nav:
+        for sym in nav.outline(args.file):
+            print(f"{sym.location.line:5d}  {sym.kind:<12} {sym.name}")
+    return 0
+
+
+def cmd_refs(args: argparse.Namespace) -> int:
+    with SymbolNavigator(BuildConfig(repo=args.repo, work_dir=args.work_dir, compiler=args.compiler)) as nav:
+        matches = nav.find(args.symbol)
+        if not matches:
+            print(f"no symbol named '{args.symbol}' in {nav.repo}", file=sys.stderr)
+            return 1
+        names = sorted({m.name for m in matches})
+        if len(names) > 1:
+            print(f"'{args.symbol}' is ambiguous; qualify it:", file=sys.stderr)
+            for name in names:
+                print(f"  {name}", file=sys.stderr)
+            return 1
+        symbol = matches[0]
+        print(f"{symbol.name}  ({symbol.kind})")
+        signature = nav.signature(symbol.location)
+        if signature:
+            print("  " + signature.replace("\n", "\n  "))
+        refs = nav.references(symbol.location)
+        files = sorted({r.file for r in refs})
+        print(f"\n{len(refs)} references in {len(files)} files:")
+        for ref in refs:
+            print(f"  {str(ref):<40} {ref.text}")
+        if symbol.kind in ("function", "method", "constructor"):
+            callers = nav.callers(symbol.location)
+            print(f"\n{len(callers)} callers:")
+            for caller in callers:
+                print(f"  {str(caller.location):<40} {caller.name}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="refactor-pilot", description=__doc__.splitlines()[0])
     parser.add_argument("--version", action="version", version=__version__)
@@ -97,6 +138,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--baseline", type=Path, required=True)
     p.set_defaults(func=cmd_check)
 
+    def add_lsp_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("repo", type=Path, help="path to a CMake project")
+        p.add_argument("--work-dir", type=Path, default=None)
+        p.add_argument("--compiler", default="clang++")
+
+    p = sub.add_parser("symbols", help="list the symbols declared in a file")
+    add_lsp_args(p)
+    p.add_argument("file", help="file path, relative to the repo")
+    p.set_defaults(func=cmd_symbols)
+
+    p = sub.add_parser("refs", help="show every reference to a symbol")
+    add_lsp_args(p)
+    p.add_argument("symbol", help="name, optionally qualified: Warehouse::add_item")
+    p.set_defaults(func=cmd_refs)
+
     p = sub.add_parser("score", help="count resolved legacy constructs from a manifest")
     p.add_argument("repo", type=Path)
     p.add_argument("--manifest", type=Path, required=True)
@@ -109,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except ToolMissing as exc:
+    except (ToolMissing, LspError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except BuildFailed as exc:

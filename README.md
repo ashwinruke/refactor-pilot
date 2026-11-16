@@ -3,8 +3,8 @@
 An LSP-powered agent that modernizes legacy C++ (C++11/14 → C++20) in small,
 verified, reversible change-sets, and delivers the result as a reviewable branch.
 
-**Status: Phase 0 of 8.** The verification baseline, the benchmark fixture and the
-scoring harness exist. Nothing rewrites code yet.
+**Status:** The verification baseline, the benchmark fixture, the
+scoring harness and the clangd-based symbol navigator exist. Nothing rewrites code yet.
 
 ## Why it is built this way
 
@@ -39,6 +39,18 @@ refactor-pilot check fixtures/legacy_inventory --baseline fixture.baseline.json
 refactor-pilot score fixtures/legacy_inventory --manifest fixtures/legacy_inventory/manifest.json -v
 ```
 
+```bash
+# Every symbol declared in a file
+refactor-pilot symbols fixtures/legacy_inventory include/inventory/warehouse.h
+
+# A symbol's signature, every reference across files, and its callers
+refactor-pilot refs fixtures/legacy_inventory Warehouse::release
+```
+
+`refs` is semantic, not textual: it tells `Item::total_value` from
+`Warehouse::total_value`, and finds uses inside macros. The definition plus all
+references is the unit Phase 2 turns into one atomic change-set.
+
 Target repos must be CMake projects. Build trees go to the system temp directory unless `--work-dir` is given.
 
 ## The fixture
@@ -57,6 +69,35 @@ constructs, listed in its `manifest.json` and grouped by the recipe meant to fix
 
 It builds with two known warnings and five passing tests, on purpose: that is the baseline the tool must not make worse.
 
+## LLM provider (used from Phase 4)
+
+Phases 0–3 use no LLM. From Phase 4, the agent talks to any **OpenAI-compatible
+chat-completions endpoint**, so the provider is a config choice, not a code change:
+
+```bash
+export REFACTOR_PILOT_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"
+export REFACTOR_PILOT_MODEL="<a model on your provider's free tier>"
+export REFACTOR_PILOT_API_KEY="..."
+```
+
+The project is developed against **free API tiers** (Google Gemini via AI Studio as
+the primary, Groq as the fallback; OpenRouter's free models also work). Free tiers
+change often and are rate-limited per minute and per day, so the agent throttles,
+backs off on HTTP 429, and stops at a configurable request/token budget. Check your
+provider's own rate-limit page for current numbers.
+
+**A stronger model is expected to give better results.** The model only handles the
+judgement-heavy recipes (ownership, macros, SFINAE). Every edit it proposes must pass
+the same verification gate, and an edit that fails is rolled back and reported as
+skipped. So model quality mainly changes *how much gets migrated and how many retries
+it takes*, not whether the output is safe to merge. Pointing the three variables above
+at a stronger paid model (for example a Claude, GPT or Gemini Pro-class model) should
+raise the share of constructs resolved, especially for R2. The Phase 7 benchmark
+reports the score per model so this is measured rather than assumed.
+
+**Privacy:** some free tiers may use your prompts to improve their products. Use free
+tiers on open-source code only; use a paid tier for anything private.
+
 ## Layout
 
 ```
@@ -65,22 +106,10 @@ src/refactor_pilot/
   diagnostics.py   parse compiler / clang-tidy output
   build.py         configure, build, ctest, clang-tidy (out-of-tree)
   baseline.py      snapshots and the regression comparison
+  lsp/             JSON-RPC framing, position conversion, clangd client
+  navigator.py     find / outline / references / signature / callers / live diagnostics
   evalkit/         manifests and scoring
-  cli.py           baseline | check | score
+  cli.py           baseline | check | score | symbols | refs
 fixtures/legacy_inventory/   benchmark target
 tests/                       unit tests + end-to-end tests with injected bugs
 ```
-
-## Roadmap
-
-| Phase | Deliverable |
-|---|---|
-| 0 | Fixture, baseline, scoring harness ✅ |
-| 1 | `clangd` client and symbol navigator |
-| 2 | Git worktree checkpoints, fast/full verification gates |
-| 3 | R1 end to end (no LLM) |
-| 4 | Agent loop and R2 (ownership) |
-| 5 | R6 dead-code pruner with confidence tiers |
-| 6 | R3–R5 |
-| 7 | Benchmark on real open-source repos |
-| 8 | MCP server, GitHub Action |

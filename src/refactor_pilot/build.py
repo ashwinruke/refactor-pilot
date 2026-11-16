@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -55,14 +56,17 @@ class BuildResult:
     seconds: float
 
 
-def build(cfg: BuildConfig, kind: str = "plain", sanitize: bool = False) -> BuildResult:
-    """Configure and build. Raises BuildFailed if the tree does not compile."""
+def configure(cfg: BuildConfig, kind: str = "plain", sanitize: bool = False) -> Path:
+    """Run cmake configure and return the build directory.
+
+    This alone produces compile_commands.json, which is all clangd needs.
+    """
     for tool in ("cmake", "ninja", cfg.compiler):
         require(tool)
     bdir = cfg.build_dir(kind)
     bdir.mkdir(parents=True, exist_ok=True)
     flags = cfg.warning_flags + (" " + SANITIZER_FLAGS if sanitize else "")
-    configure = run(
+    result = run(
         [
             "cmake", "-S", cfg.repo, "-B", bdir, "-G", "Ninja",
             f"-DCMAKE_CXX_COMPILER={cfg.compiler}",
@@ -72,8 +76,15 @@ def build(cfg: BuildConfig, kind: str = "plain", sanitize: bool = False) -> Buil
             *cfg.cmake_args,
         ]
     )
-    if not configure.ok:
-        raise BuildFailed("cmake configure", configure, [])
+    if not result.ok:
+        raise BuildFailed("cmake configure", result, [])
+    return bdir
+
+
+def build(cfg: BuildConfig, kind: str = "plain", sanitize: bool = False) -> BuildResult:
+    """Configure and build. Raises BuildFailed if the tree does not compile."""
+    start = time.monotonic()
+    bdir = configure(cfg, kind, sanitize)
     # Always a clean build: an incremental build skips up-to-date files and so
     # prints none of their warnings, which would make a snapshot look cleaner
     # than the code is. (Phase 2 replaces this with a per-file warning cache.)
@@ -81,7 +92,7 @@ def build(cfg: BuildConfig, kind: str = "plain", sanitize: bool = False) -> Buil
     diags = diagnostics.parse(compiled.output, cfg.repo)
     if not compiled.ok:
         raise BuildFailed("build", compiled, [d for d in diags if d.severity == "error"])
-    return BuildResult(bdir, [d for d in diags if d.severity == "warning"], configure.seconds + compiled.seconds)
+    return BuildResult(bdir, [d for d in diags if d.severity == "warning"], time.monotonic() - start)
 
 
 def run_tests(cfg: BuildConfig, build_dir: Path, sanitize: bool = False) -> dict[str, str]:
