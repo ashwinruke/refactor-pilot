@@ -3,8 +3,9 @@
 An LSP-powered agent that modernizes legacy C++ (C++11/14 → C++20) in small,
 verified, reversible change-sets, and delivers the result as a reviewable branch.
 
-**Status:** The verification baseline, the benchmark fixture, the
-scoring harness and the clangd-based symbol navigator exist. Nothing rewrites code yet.
+**Status:** The verification gates, git checkpoints, the executor
+loop, the symbol navigator and the benchmark fixture exist. The tool can push
+patches you give it through the gates; it does not yet write its own.
 
 ## Why it is built this way
 
@@ -51,7 +52,19 @@ refactor-pilot refs fixtures/legacy_inventory Warehouse::release
 `Warehouse::total_value`, and finds uses inside macros. The definition plus all
 references is the unit Phase 2 turns into one atomic change-set.
 
-Target repos must be CMake projects. Build trees go to the system temp directory unless `--work-dir` is given.
+```bash
+# Push patches through the gates onto a new branch (your working tree is untouched)
+refactor-pilot apply fixtures/legacy_inventory --patch examples/patches/*.patch
+```
+
+Each patch is one change-set: it is applied in a private git worktree, checked by
+the **fast gate** (incremental build, no new warnings, no test regressions) and
+committed, or rolled back. Every few commits the **full gate** reruns the tests
+under ASan + UBSan; if that fails, a binary search finds the commit responsible,
+removes it and re-applies the later ones. Of the six example patches, three are
+deliberately bad and all three are removed.
+
+Target repos must be CMake projects, and `apply` needs them to be in a git repository. Build trees go to the system temp directory unless `--work-dir` is given.
 
 ## The fixture
 
@@ -106,10 +119,14 @@ src/refactor_pilot/
   diagnostics.py   parse compiler / clang-tidy output
   build.py         configure, build, ctest, clang-tidy (out-of-tree)
   baseline.py      snapshots and the regression comparison
+  checkpoint.py    private git worktree: commit, rollback, cherry-pick
+  gates.py         fast gate and full gate, with feedback text for retries
+  session.py       executor loop: apply -> verify -> commit or roll back; culprit search
   lsp/             JSON-RPC framing, position conversion, clangd client
   navigator.py     find / outline / references / signature / callers / live diagnostics
   evalkit/         manifests and scoring
-  cli.py           baseline | check | score | symbols | refs
+  cli.py           baseline | check | score | symbols | refs | apply
+examples/patches/            three good and three bad patches for the fixture
 fixtures/legacy_inventory/   benchmark target
 tests/                       unit tests + end-to-end tests with injected bugs
 ```

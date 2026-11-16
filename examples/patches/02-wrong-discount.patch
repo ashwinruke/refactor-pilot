@@ -1,0 +1,13 @@
+Subject: BAD: changes the 10-unit discount (breaks a test)
+
+--- a/src/pricing.cpp
++++ b/src/pricing.cpp
+@@ -14,7 +14,7 @@
+         return 0.20;
+     }
+     if (quantity >= 10) {
+-        return 0.10;
++        return 0.15;
+     }
+     return 0.0;
+ }

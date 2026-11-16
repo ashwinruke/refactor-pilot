@@ -1,0 +1,12 @@
+Subject: BAD: drops a delete (tests pass, sanitizers catch the leak)
+
+--- a/src/warehouse.cpp
++++ b/src/warehouse.cpp
+@@ -36,7 +36,6 @@
+     if (item == NULL) {
+         return false;
+     }
+-    delete item;
+     return true;
+ }
+ 

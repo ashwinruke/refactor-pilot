@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 import xml.etree.ElementTree as ET
@@ -95,8 +96,14 @@ def build(cfg: BuildConfig, kind: str = "plain", sanitize: bool = False) -> Buil
     return BuildResult(bdir, [d for d in diags if d.severity == "warning"], time.monotonic() - start)
 
 
-def run_tests(cfg: BuildConfig, build_dir: Path, sanitize: bool = False) -> dict[str, str]:
-    """Run ctest and return {test name: "pass" | "fail"}."""
+def run_tests(
+    cfg: BuildConfig, build_dir: Path, sanitize: bool = False, failure_output: dict[str, str] | None = None
+) -> dict[str, str]:
+    """Run ctest and return {test name: "pass" | "fail"}.
+
+    If `failure_output` is given it is filled with {test name: captured output}
+    for failing tests, so a gate can explain what went wrong.
+    """
     require("ctest")
     junit = build_dir / "refactor-pilot-junit.xml"
     junit.unlink(missing_ok=True)
@@ -113,8 +120,12 @@ def run_tests(cfg: BuildConfig, build_dir: Path, sanitize: bool = False) -> dict
         return {}
     results: dict[str, str] = {}
     for case in ET.parse(junit).getroot().iter("testcase"):
+        name = case.get("name", "?")
         passed = case.get("status") == "run" and case.find("failure") is None
-        results[case.get("name", "?")] = "pass" if passed else "fail"
+        results[name] = "pass" if passed else "fail"
+        if not passed and failure_output is not None:
+            out = case.find("system-out")
+            failure_output[name] = (out.text or "").strip() if out is not None else ""
     return dict(sorted(results.items()))
 
 
@@ -148,3 +159,133 @@ def run_tidy(cfg: BuildConfig, build_dir: Path, checks: str = DEFAULT_TIDY_CHECK
     diags = diagnostics.parse(output, cfg.repo)
     # Compiler warnings also show up in clang-tidy output; keep tidy checks only.
     return [d for d in diags if d.flag and not d.flag.startswith("-W") and not d.flag.startswith("clang-diagnostic")]
+
+
+_EDGE = re.compile(r"^\[\d+/\d+\] Building C(?:XX)? object (\S+)")
+_FAILED = re.compile(r"^FAILED: (\S+)")
+_OTHER_EDGE = re.compile(r"^\[\d+/\d+\] ")
+
+
+def split_by_object(output: str) -> tuple[dict[str, str], str]:
+    """Split ninja output into {object file: its compiler output} plus the rest.
+
+    Ninja prints each finished compile as a status line followed by everything
+    that compile wrote, so the text between two status lines belongs to one object.
+    """
+    per_object: dict[str, list[str]] = {}
+    rest: list[str] = []
+    current: str | None = None
+    for line in output.splitlines():
+        edge, failed = _EDGE.match(line), _FAILED.match(line)
+        if edge:
+            current = edge.group(1)
+            per_object.setdefault(current, [])
+        elif failed:
+            current = failed.group(1)
+            per_object.setdefault(current, [])
+        elif _OTHER_EDGE.match(line):
+            current = None
+        elif current is not None:
+            per_object[current].append(line)
+        else:
+            rest.append(line)
+    return {obj: "\n".join(lines) for obj, lines in per_object.items()}, "\n".join(rest)
+
+
+def known_objects(compile_db: list[dict], build_dir: Path) -> set[str]:
+    """Object files the build produces, as ninja names them (build-dir relative).
+
+    CMake 3.x writes the "output" of each compile_commands.json entry relative
+    to the build directory; CMake 4.x writes it as an absolute path. Ninja's
+    status lines are always relative, so both forms are normalized to that.
+    """
+    build_dir = Path(build_dir).resolve()
+    known: set[str] = set()
+    for entry in compile_db:
+        output = entry.get("output")
+        if not output:
+            continue
+        path = Path(output)
+        if not path.is_absolute():
+            path = Path(entry.get("directory", build_dir)) / path
+        try:
+            known.add(Path(os.path.normpath(path)).relative_to(build_dir).as_posix())
+        except ValueError:
+            known.add(Path(output).as_posix())
+    return known
+
+
+@dataclass
+class IncrementalResult:
+    ok: bool
+    warnings: list[Diagnostic]  # for the whole tree, including files not rebuilt
+    errors: list[Diagnostic]
+    rebuilt: int  # number of objects compiled this time
+    seconds: float
+    log: str
+
+
+class IncrementalBuilder:
+    """Builds only what changed, yet still reports every warning in the tree.
+
+    An incremental build prints nothing for up-to-date files. To keep the
+    warning count honest, the warnings of each object file are cached; a rebuilt
+    object replaces its entry and an untouched object keeps the cached one.
+    """
+
+    def __init__(self, cfg: BuildConfig, kind: str = "plain", sanitize: bool = False):
+        self.cfg, self.kind, self.sanitize = cfg, kind, sanitize
+        self.build_dir = cfg.build_dir(kind)
+        self._cache_path = self.build_dir / "refactor-pilot-warnings.json"
+
+    def _load(self) -> dict[str, list[dict]] | None:
+        try:
+            return json.loads(self._cache_path.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def build(self) -> IncrementalResult:
+        start = time.monotonic()
+        configure(self.cfg, self.kind, self.sanitize)
+        cache = self._load()
+        command = ["cmake", "--build", self.build_dir, "--parallel", str(self.cfg.jobs)]
+        if cache is None:  # no trustworthy cache yet: compile everything once
+            cache = {}
+            command.append("--clean-first")
+        result = run([*command, "--", "-k", "0"])
+        per_object, rest = split_by_object(result.output)
+        errors: list[Diagnostic] = []
+        for obj, text in per_object.items():
+            diags = diagnostics.parse(text, self.cfg.repo)
+            errors += [d for d in diags if d.severity == "error"]
+            cache[obj] = [d.__dict__ for d in diags if d.severity == "warning"]
+        errors += [d for d in diagnostics.parse(rest, self.cfg.repo) if d.severity == "error"]
+        # Forget objects that no longer exist in the build (deleted source files).
+        try:
+            db = json.loads((self.build_dir / "compile_commands.json").read_text())
+            known = known_objects(db, self.build_dir)
+            if known:
+                cache = {obj: w for obj, w in cache.items() if obj in known}
+        except (OSError, ValueError):
+            pass
+        if result.ok:
+            self._cache_path.write_text(json.dumps(cache))
+        else:
+            # A failed build leaves the cache unsure; drop the failed objects only.
+            for obj, text in per_object.items():
+                if any(d.severity == "error" for d in diagnostics.parse(text, self.cfg.repo)):
+                    cache.pop(obj, None)
+            self._cache_path.write_text(json.dumps(cache))
+        merged: dict[tuple, Diagnostic] = {}
+        for entries in cache.values():
+            for raw in entries:
+                d = Diagnostic(**raw)
+                merged.setdefault((d.file, d.line, d.col, d.flag, d.message), d)
+        return IncrementalResult(
+            ok=result.ok,
+            warnings=list(merged.values()),
+            errors=errors,
+            rebuilt=len(per_object),
+            seconds=time.monotonic() - start,
+            log=result.output,
+        )

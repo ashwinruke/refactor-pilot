@@ -1,0 +1,33 @@
+Subject: use nullptr in logger.cpp
+
+--- a/src/logger.cpp
++++ b/src/logger.cpp
+@@ -2,23 +2,23 @@
+ 
+ namespace inventory {
+ 
+-Logger::Logger(const char* path) : file_(NULL), lines_(0) {
+-    if (path != NULL) {
++Logger::Logger(const char* path) : file_(nullptr), lines_(0) {
++    if (path != nullptr) {
+         file_ = fopen(path, "w");
+     }
+ }
+ 
+ Logger::~Logger() {
+-    if (file_ != NULL) {
++    if (file_ != nullptr) {
+         fclose(file_);
+     }
+ }
+ 
+-bool Logger::is_open() const { return file_ != NULL; }
++bool Logger::is_open() const { return file_ != nullptr; }
+ 
+ void Logger::log(const char* level, const std::string& message) {
+     mutex_.lock();
+-    if (file_ == NULL) {
++    if (file_ == nullptr) {
+         mutex_.unlock();
+         return;
+     }

@@ -1,0 +1,15 @@
+Subject: range-for in Warehouse::total_value (also fixes a warning)
+
+--- a/src/warehouse.cpp
++++ b/src/warehouse.cpp
+@@ -53,8 +53,8 @@
+ 
+ double Warehouse::total_value() const {
+     double total = 0.0;
+-    for (int i = 0; i < items_.size(); ++i) {
+-        total += items_[i]->total_value();
++    for (const Item* item : items_) {
++        total += item->total_value();
+     }
+     return total;
+ }

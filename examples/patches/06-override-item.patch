@@ -1,0 +1,22 @@
+Subject: mark PerishableItem overrides with override
+
+--- a/include/inventory/item.h
++++ b/include/inventory/item.h
+@@ -34,13 +34,13 @@
+ class PerishableItem : public Item {
+ public:
+     PerishableItem(ItemId id, const std::string& name, double unit_price, int quantity, int days_to_expiry);
+-    virtual ~PerishableItem();
++    ~PerishableItem() override;
+ 
+     int days_to_expiry() const { return days_to_expiry_; }
+ 
+-    virtual Category category() const;
+-    virtual double total_value() const;
+-    virtual std::string describe() const;
++    Category category() const override;
++    double total_value() const override;
++    std::string describe() const override;
+ 
+ private:
+     int days_to_expiry_;

@@ -6,6 +6,7 @@ Commands:
   score     report how many known legacy constructs from a manifest are gone
   symbols   list the symbols declared in one file (via clangd)
   refs      show a symbol's signature, callers and every reference (via clangd)
+  apply     push patches through the verification gates onto a new branch
 """
 
 from __future__ import annotations
@@ -16,9 +17,11 @@ from pathlib import Path
 
 from . import __version__, baseline
 from .build import BuildConfig, BuildFailed
+from .checkpoint import CheckpointError
 from .evalkit import score as scoremod
 from .lsp import LspError
 from .navigator import SymbolNavigator
+from .session import ChangeSet, Session
 from .toolchain import ToolMissing
 
 
@@ -116,6 +119,52 @@ def cmd_refs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _patch_change_set(session: Session, patch: Path) -> ChangeSet:
+    description = patch.stem
+    for line in patch.read_text(errors="replace").splitlines()[:5]:
+        if line.lower().startswith("subject:"):
+            description = line.split(":", 1)[1].strip()
+            break
+    return ChangeSet(patch.stem, description, lambda repo, feedback: session.workspace.apply_patch(patch))
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    missing = [p for p in args.patch if not p.is_file()]
+    if missing:
+        print(f"error: no such patch file: {missing[0]}", file=sys.stderr)
+        return 2
+    session = Session(
+        args.repo, work_dir=args.work_dir, compiler=args.compiler, branch=args.branch,
+        sanitizers=not args.no_sanitizers, full_every=args.full_every,
+        allow_dirty=args.allow_dirty, keep_worktree=args.keep_worktree,
+        log=lambda message: print(f"  {message}", flush=True),
+    )
+    with session:
+        print(f"branch {session.workspace.branch} (private worktree: {session.workspace.worktree})")
+        for patch in args.patch:
+            session.run(_patch_change_set(session, patch))
+    report = session.report
+    print()
+    for outcome in report.outcomes:
+        sha = outcome.sha[:8] if outcome.sha else "-" * 8
+        print(f"{outcome.status:<11} {sha}  {outcome.id}: {outcome.description}")
+        if outcome.reason:
+            print(f"{'':<21} reason: {outcome.reason}")
+    kept = report.count("committed")
+    print(
+        f"\n{kept} committed, {report.count('rolled_back')} rolled back, {report.count('reverted')} reverted, "
+        f"{report.count('no_change')} unchanged; {report.full_gates} full-gate runs; {report.seconds:.0f}s"
+    )
+    if kept:
+        print(f"result is on branch '{report.branch}'. Your working tree was not touched.")
+        print(f"  review:  git log --oneline {report.base_sha[:8]}..{report.branch}")
+        print(f"  diff:    git diff {report.base_sha[:8]} {report.branch}")
+        print(f"  accept:  git merge {report.branch}")
+    else:
+        print("nothing passed the gates; no branch was left behind.")
+    return 0 if kept == len(report.outcomes) else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="refactor-pilot", description=__doc__.splitlines()[0])
     parser.add_argument("--version", action="version", version=__version__)
@@ -153,6 +202,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("symbol", help="name, optionally qualified: Warehouse::add_item")
     p.set_defaults(func=cmd_refs)
 
+    p = sub.add_parser("apply", help="apply patches as verified change-sets on a new branch")
+    p.add_argument("repo", type=Path, help="path to a CMake project inside a git repository")
+    p.add_argument("--patch", type=Path, nargs="+", required=True, help="unified diffs, paths relative to the repo")
+    p.add_argument("--branch", default=None, help="branch to create (default: refactor-pilot/<timestamp>)")
+    p.add_argument("--full-every", type=int, default=5, help="run the full gate after this many commits")
+    p.add_argument("--work-dir", type=Path, default=None)
+    p.add_argument("--compiler", default="clang++")
+    p.add_argument("--no-sanitizers", action="store_true")
+    p.add_argument("--allow-dirty", action="store_true", help="proceed even if the target has uncommitted changes")
+    p.add_argument("--keep-worktree", action="store_true", help="leave the private worktree on disk afterwards")
+    p.set_defaults(func=cmd_apply)
+
     p = sub.add_parser("score", help="count resolved legacy constructs from a manifest")
     p.add_argument("repo", type=Path)
     p.add_argument("--manifest", type=Path, required=True)
@@ -165,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (ToolMissing, LspError) as exc:
+    except (ToolMissing, LspError, CheckpointError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except BuildFailed as exc:
