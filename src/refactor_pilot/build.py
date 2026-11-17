@@ -143,22 +143,49 @@ def source_files(cfg: BuildConfig, build_dir: Path) -> list[Path]:
     return sorted(set(files))
 
 
+def repo_header_filter(cfg: BuildConfig) -> str:
+    """clang-tidy --header-filter regex matching every header inside the repo."""
+    return "^" + re.escape(str(cfg.repo).replace("\\", "/")) + "/.*"
+
+
+NO_HEADERS = "^$"  # a --header-filter that matches no header
+
+
+def tidy_file(
+    cfg: BuildConfig, build_dir: Path, path: Path, checks: str, header_filter: str | None = None, fix: bool = False
+) -> list[Diagnostic]:
+    """Run clang-tidy on one translation unit. With fix=True, apply its fix-its in place.
+
+    Returns the clang-tidy findings (compiler warnings are filtered out).
+    """
+    require("clang-tidy")
+    command = [
+        "clang-tidy", "-p", build_dir, f"--checks={checks}",
+        f"--header-filter={header_filter or repo_header_filter(cfg)}", "--quiet",
+    ]
+    if fix:
+        command.append("--fix")
+        if (cfg.repo / ".clang-format").exists():
+            # Re-format only the lines a fix touched, in the project's own style.
+            command.append("--format-style=file")
+    output = run([*command, path]).output
+    return [d for d in diagnostics.parse(output, cfg.repo) if _is_tidy_check(d)]
+
+
+def _is_tidy_check(d: Diagnostic) -> bool:
+    return bool(d.flag) and not d.flag.startswith("-W") and not d.flag.startswith("clang-diagnostic")
+
+
 def run_tidy(cfg: BuildConfig, build_dir: Path, checks: str = DEFAULT_TIDY_CHECKS) -> list[Diagnostic]:
     """Run clang-tidy over every project translation unit (and its headers)."""
     require("clang-tidy")
-    header_filter = "^" + str(cfg.repo).replace("\\", "/") + "/.*"
-
-    def one(path: Path) -> str:
-        return run(
-            ["clang-tidy", "-p", build_dir, f"--checks={checks}",
-             f"--header-filter={header_filter}", "--quiet", path]
-        ).output
-
     with ThreadPoolExecutor(max_workers=cfg.jobs) as pool:
-        output = "\n".join(pool.map(one, source_files(cfg, build_dir)))
-    diags = diagnostics.parse(output, cfg.repo)
-    # Compiler warnings also show up in clang-tidy output; keep tidy checks only.
-    return [d for d in diags if d.flag and not d.flag.startswith("-W") and not d.flag.startswith("clang-diagnostic")]
+        per_file = pool.map(lambda path: tidy_file(cfg, build_dir, path, checks), source_files(cfg, build_dir))
+    merged: dict[tuple, Diagnostic] = {}
+    for diags in per_file:  # a header finding is reported by every file that includes it
+        for d in diags:
+            merged.setdefault((d.file, d.line, d.col, d.flag, d.message), d)
+    return list(merged.values())
 
 
 _EDGE = re.compile(r"^\[\d+/\d+\] Building C(?:XX)? object (\S+)")

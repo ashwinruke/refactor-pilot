@@ -3,9 +3,11 @@
 An LSP-powered agent that modernizes legacy C++ (C++11/14 → C++20) in small,
 verified, reversible change-sets, and delivers the result as a reviewable branch.
 
-**Status:** The verification gates, git checkpoints, the executor
-loop, the symbol navigator and the benchmark fixture exist. The tool can push
-patches you give it through the gates; it does not yet write its own.
+**Status:** The tool now modernizes code on its own: recipe R1 applies
+mechanical fixes (`nullptr`, `override`, range-for, `using`, `= delete`, C++ casts)
+proposed by `clang-tidy`, one verified commit at a time. On the fixture it resolves
+11 of 32 planted constructs (all of R1) in 19 commits. Recipes that need judgement
+(ownership, macros, SFINAE, dead code) come next.
 
 ## Why it is built this way
 
@@ -64,7 +66,17 @@ under ASan + UBSan; if that fails, a binary search finds the commit responsible,
 removes it and re-applies the later ones. Of the six example patches, three are
 deliberately bad and all three are removed.
 
-Target repos must be CMake projects, and `apply` needs them to be in a git repository. Build trees go to the system temp directory unless `--work-dir` is given.
+```bash
+# Run recipe R1 on a new branch and report the benchmark score before and after
+refactor-pilot run fixtures/legacy_inventory --manifest fixtures/legacy_inventory/manifest.json
+```
+
+`run` asks `clang-tidy` for fixes one check and one file at a time. Each becomes
+a change-set that must pass the same gates as any patch, so a fix that breaks the
+build, adds a warning or fails a test is rolled back and reported, not merged.
+Public function signatures are left alone by default.
+
+Target repos must be CMake projects, and `apply` and `run` need them to be in a git repository. Build trees go to the system temp directory unless `--work-dir` is given.
 
 ## The fixture
 
@@ -122,10 +134,11 @@ src/refactor_pilot/
   checkpoint.py    private git worktree: commit, rollback, cherry-pick
   gates.py         fast gate and full gate, with feedback text for retries
   session.py       executor loop: apply -> verify -> commit or roll back; culprit search
+  recipes/         r1_mechanical.py: clang-tidy fix-its as verified change-sets
   lsp/             JSON-RPC framing, position conversion, clangd client
   navigator.py     find / outline / references / signature / callers / live diagnostics
   evalkit/         manifests and scoring
-  cli.py           baseline | check | score | symbols | refs | apply
+  cli.py           baseline | check | score | symbols | refs | apply | run
 examples/patches/            three good and three bad patches for the fixture
 fixtures/legacy_inventory/   benchmark target
 tests/                       unit tests + end-to-end tests with injected bugs

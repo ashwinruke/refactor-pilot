@@ -7,6 +7,7 @@ Commands:
   symbols   list the symbols declared in one file (via clangd)
   refs      show a symbol's signature, callers and every reference (via clangd)
   apply     push patches through the verification gates onto a new branch
+  run       run a modernization recipe (r1: mechanical fixes via clang-tidy)
 """
 
 from __future__ import annotations
@@ -16,11 +17,13 @@ import sys
 from pathlib import Path
 
 from . import __version__, baseline
+from . import build as buildmod
 from .build import BuildConfig, BuildFailed
 from .checkpoint import CheckpointError
 from .evalkit import score as scoremod
 from .lsp import LspError
 from .navigator import SymbolNavigator
+from .recipes import r1_mechanical
 from .session import ChangeSet, Session
 from .toolchain import ToolMissing
 
@@ -143,9 +146,15 @@ def cmd_apply(args: argparse.Namespace) -> int:
         print(f"branch {session.workspace.branch} (private worktree: {session.workspace.worktree})")
         for patch in args.patch:
             session.run(_patch_change_set(session, patch))
-    report = session.report
+    return 0 if _print_report(session.report) == len(session.report.outcomes) else 1
+
+
+def _print_report(report, show_unchanged: bool = True) -> int:
+    """Print one line per change-set and the summary. Returns the number committed."""
     print()
     for outcome in report.outcomes:
+        if outcome.status == "no_change" and not show_unchanged:
+            continue
         sha = outcome.sha[:8] if outcome.sha else "-" * 8
         print(f"{outcome.status:<11} {sha}  {outcome.id}: {outcome.description}")
         if outcome.reason:
@@ -161,8 +170,35 @@ def cmd_apply(args: argparse.Namespace) -> int:
         print(f"  diff:    git diff {report.base_sha[:8]} {report.branch}")
         print(f"  accept:  git merge {report.branch}")
     else:
-        print("nothing passed the gates; no branch was left behind.")
-    return 0 if kept == len(report.outcomes) else 1
+        print("nothing was committed; no branch was left behind.")
+    return kept
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    checks = [c.strip() for c in args.checks.split(",") if c.strip()] if args.checks else None
+    session = Session(
+        args.repo, work_dir=args.work_dir, compiler=args.compiler, branch=args.branch,
+        sanitizers=not args.no_sanitizers, full_every=args.full_every,
+        allow_dirty=args.allow_dirty, keep_worktree=args.keep_worktree,
+        log=lambda message: print(f"  {message}", flush=True),
+    )
+    with session:
+        print(f"branch {session.workspace.branch} (private worktree: {session.workspace.worktree})")
+        findings_before = len(buildmod.run_tidy(session.cfg, session.build_dir))
+        score_before = scoremod.score(session.workspace.repo, args.manifest) if args.manifest else None
+        r1_mechanical.run(session, checks)
+        session.checkpoint()  # settle everything before measuring
+        findings_after = len(buildmod.run_tidy(session.cfg, session.build_dir))
+        score_after = scoremod.score(session.workspace.repo, args.manifest) if args.manifest else None
+    _print_report(session.report, show_unchanged=args.verbose)
+    print(f"\nclang-tidy modernize findings: {findings_before} -> {findings_after}")
+    if score_after is not None:
+        print(f"manifest score: {len(score_before.resolved)}/{score_before.total} -> "
+              f"{len(score_after.resolved)}/{score_after.total} legacy constructs resolved")
+        for recipe, (done, total) in score_after.by_recipe.items():
+            was = score_before.by_recipe[recipe][0]
+            print(f"  {recipe}: {was}/{total} -> {done}/{total}")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -213,6 +249,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-dirty", action="store_true", help="proceed even if the target has uncommitted changes")
     p.add_argument("--keep-worktree", action="store_true", help="leave the private worktree on disk afterwards")
     p.set_defaults(func=cmd_apply)
+
+    p = sub.add_parser("run", help="run a modernization recipe on a new branch")
+    p.add_argument("repo", type=Path, help="path to a CMake project inside a git repository")
+    p.add_argument("--recipe", choices=["r1"], default="r1", help="r1: mechanical fixes via clang-tidy")
+    p.add_argument("--checks", default=None, help="comma-separated clang-tidy checks (default: the R1 list)")
+    p.add_argument("--manifest", type=Path, default=None, help="benchmark manifest; prints the score before and after")
+    p.add_argument("--branch", default=None)
+    p.add_argument("--full-every", type=int, default=5)
+    p.add_argument("--work-dir", type=Path, default=None)
+    p.add_argument("--compiler", default="clang++")
+    p.add_argument("--no-sanitizers", action="store_true")
+    p.add_argument("--allow-dirty", action="store_true")
+    p.add_argument("--keep-worktree", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true", help="also list findings that have no automatic fix")
+    p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("score", help="count resolved legacy constructs from a manifest")
     p.add_argument("repo", type=Path)

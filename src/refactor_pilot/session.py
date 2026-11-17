@@ -36,6 +36,7 @@ class ChangeSet:
     id: str
     description: str
     apply: Callable[[Path, str | None], None]
+    no_change_reason: str = "the edit changed nothing"
 
 
 @dataclass
@@ -90,6 +91,16 @@ class Session:
         self._last_green = ""
         self._full_gates = 0
         self._started = 0.0
+
+    @property
+    def cfg(self) -> BuildConfig:
+        """Build configuration of the private checkout (recipes edit and lint here)."""
+        return self.verifier.cfg
+
+    @property
+    def build_dir(self) -> Path:
+        """Build tree of the private checkout; holds its compile_commands.json."""
+        return self.cfg.build_dir("plain")
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -151,7 +162,7 @@ class Session:
                 break
             outcome.files = ws.changed_files()
             if not outcome.files:
-                outcome.status, outcome.reason = "no_change", "the edit changed nothing"
+                outcome.status, outcome.reason = "no_change", change.no_change_reason
                 break
             gate = self.verifier.fast()
             if gate.ok:
