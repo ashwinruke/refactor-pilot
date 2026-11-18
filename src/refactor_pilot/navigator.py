@@ -42,6 +42,7 @@ class Symbol:
     kind: str
     location: Location  # where the name is written
     end_line: int = 0  # last line of the symbol's body, when known (outline only)
+    start_line: int = 0  # first line of the whole declaration, when known (outline only)
 
 
 @dataclass(frozen=True)
@@ -143,13 +144,15 @@ class SymbolNavigator:
                 name = f"{prefix}::{node['name']}" if prefix else node["name"]
                 if "selectionRange" in node:  # hierarchical DocumentSymbol
                     start, end = node["selectionRange"]["start"], node["range"]["end"]
-                    out.append(Symbol(name, SYMBOL_KINDS.get(node["kind"], "?"), self._from_lsp(uri, start), end["line"] + 1))
+                    out.append(Symbol(name, SYMBOL_KINDS.get(node["kind"], "?"), self._from_lsp(uri, start),
+                                      end["line"] + 1, node["range"]["start"]["line"] + 1))
                     walk(node.get("children", []), name)
                 else:  # flat SymbolInformation
                     container = node.get("containerName", "")
                     full = f"{container}::{node['name']}" if container else node["name"]
                     rng = node["location"]["range"]
-                    out.append(Symbol(full, SYMBOL_KINDS.get(node["kind"], "?"), self._from_lsp(uri, rng["start"]), rng["end"]["line"] + 1))
+                    out.append(Symbol(full, SYMBOL_KINDS.get(node["kind"], "?"), self._from_lsp(uri, rng["start"]),
+                                      rng["end"]["line"] + 1, rng["start"]["line"] + 1))
 
         walk(self._client.document_symbols(path), "")
         return out

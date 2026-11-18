@@ -7,7 +7,7 @@ Commands:
   symbols   list the symbols declared in one file (via clangd)
   refs      show a symbol's signature, callers and every reference (via clangd)
   apply     push patches through the verification gates onto a new branch
-  run       run a modernization recipe (r1: mechanical via clang-tidy; r2: ownership via an LLM)
+  run       run recipes: r1 mechanical (clang-tidy), r2 ownership (LLM), r6 dead code
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from .evalkit import score as scoremod
 from .lsp import LspError
 from .navigator import SymbolNavigator
 from .llm import Budget, LlmError, RecordingClient, ReplayClient, client_from_env
-from .recipes import r1_mechanical, r2_ownership
+from .recipes import r1_mechanical, r2_ownership, r6_dead_code
 from .session import ChangeSet, Session
 from .toolchain import ToolMissing
 
@@ -183,46 +183,71 @@ def _llm_client(args: argparse.Namespace):
     return RecordingClient(client, args.record) if args.record else client
 
 
+RECIPES = ("r1", "r2", "r6")
+
+
+def _parse_flags(items: list[str]) -> dict[str, bool]:
+    flags = {}
+    for item in items or []:
+        name, _, state = item.partition("=")
+        if not name or state.lower() not in ("on", "off"):
+            raise SystemExit(f"error: --flag expects NAME=on or NAME=off, got '{item}'")
+        flags[name] = state.lower() == "on"
+    return flags
+
+
 def cmd_run(args: argparse.Namespace) -> int:
+    recipes = [r.strip() for r in args.recipe.split(",") if r.strip()]
+    unknown = [r for r in recipes if r not in RECIPES]
+    if unknown or not recipes:
+        print(f"error: unknown recipe '{(unknown or [''])[0]}'. Choose from: {', '.join(RECIPES)}", file=sys.stderr)
+        return 2
     checks = [c.strip() for c in args.checks.split(",") if c.strip()] if args.checks else None
-    client = _llm_client(args) if args.recipe == "r2" and not args.plan else None
+    flags = _parse_flags(args.flag)
+    client = _llm_client(args) if "r2" in recipes and not args.plan else None
+    log = lambda message: print(f"  {message}", flush=True)  # noqa: E731
     session = Session(
         args.repo, work_dir=args.work_dir, compiler=args.compiler, branch=args.branch,
         sanitizers=not args.no_sanitizers, full_every=args.full_every,
-        allow_dirty=args.allow_dirty, keep_worktree=args.keep_worktree,
-        log=lambda message: print(f"  {message}", flush=True),
+        allow_dirty=args.allow_dirty, keep_worktree=args.keep_worktree, log=log,
     )
-    stopped = ""
+    notes: list[str] = []
     with session:
         print(f"branch {session.workspace.branch} (private worktree: {session.workspace.worktree})")
         score_before = scoremod.score(session.workspace.repo, args.manifest) if args.manifest else None
-        if args.recipe == "r2" and args.plan:
+        if args.plan:
             return _print_r2_plan(session, args.allow_api_changes)
-        if args.recipe == "r1":
-            findings_before = len(buildmod.run_tidy(session.cfg, session.build_dir))
-            r1_mechanical.run(session, checks)
-        else:
-            if isinstance(client, ReplayClient):
-                print(f"  model: replaying {args.replay} (no network, no key)")
-            else:
-                inner = client.inner if isinstance(client, RecordingClient) else client
-                print(f"  model: {inner.model} via {inner.base_url}; budget {inner.budget.max_requests} requests")
-            stopped = r2_ownership.run(
-                session, client, allow_api_changes=args.allow_api_changes, max_attempts=args.max_attempts,
-                log=lambda message: print(f"  {message}", flush=True),
-            ).stopped
+        findings_before = len(buildmod.run_tidy(session.cfg, session.build_dir)) if "r1" in recipes else 0
+        for recipe in recipes:
+            print(f"  -- recipe {recipe}")
+            if recipe == "r1":
+                r1_mechanical.run(session, checks)
+            elif recipe == "r6":
+                dead = r6_dead_code.run(session, flags, allow_api_changes=args.allow_api_changes, log=log)
+                for name in dead.flag_candidates:
+                    notes.append(f"flag never defined in this build: {name}  (to remove its branches: --flag {name}=off)")
+            elif recipe == "r2":
+                if isinstance(client, ReplayClient):
+                    print(f"  model: replaying {args.replay} (no network, no key)")
+                else:
+                    inner = client.inner if isinstance(client, RecordingClient) else client
+                    print(f"  model: {inner.model} via {inner.base_url}; budget {inner.budget.max_requests} requests")
+                stopped = r2_ownership.run(
+                    session, client, allow_api_changes=args.allow_api_changes, max_attempts=args.max_attempts, log=log,
+                ).stopped
+                if stopped:
+                    notes.append(f"stopped early: {stopped}")
         session.checkpoint()  # settle everything before measuring
-        if args.recipe == "r1":
-            findings_after = len(buildmod.run_tidy(session.cfg, session.build_dir))
+        findings_after = len(buildmod.run_tidy(session.cfg, session.build_dir)) if "r1" in recipes else 0
         score_after = scoremod.score(session.workspace.repo, args.manifest) if args.manifest else None
-    _print_report(session.report, show_unchanged=args.verbose or args.recipe == "r2")
+    _print_report(session.report, show_unchanged=args.verbose or recipes != ["r1"])
     print()
-    if args.recipe == "r1":
+    if "r1" in recipes:
         print(f"clang-tidy modernize findings: {findings_before} -> {findings_after}")
-    else:
+    if client is not None:
         print(f"model usage: {client.budget.requests} requests, {client.budget.tokens} tokens")
-        if stopped:
-            print(f"stopped early: {stopped}")
+    for note in notes:
+        print(note)
     if score_after is not None:
         print(f"manifest score: {len(score_before.resolved)}/{score_before.total} -> "
               f"{len(score_after.resolved)}/{score_after.total} legacy constructs resolved")
@@ -300,11 +325,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", help="run a modernization recipe on a new branch")
     p.add_argument("repo", type=Path, help="path to a CMake project inside a git repository")
-    p.add_argument("--recipe", choices=["r1", "r2"], default="r1",
-                   help="r1: mechanical fixes via clang-tidy; r2: ownership and RAII via an LLM")
+    p.add_argument("--recipe", default="r1",
+                   help="one or more of r1 (mechanical, clang-tidy), r2 (ownership, LLM), r6 (dead code); "
+                        "comma-separated to run several in order on one branch, e.g. r1,r6")
+    p.add_argument("--flag", action="append", default=[], metavar="NAME=on|off",
+                   help="r6: declare a compile-time flag permanently on or off; its dead branches are removed")
     p.add_argument("--checks", default=None, help="r1: comma-separated clang-tidy checks (default: the R1 list)")
     p.add_argument("--allow-api-changes", action="store_true",
-                   help="r2: allow public signatures to change (callers are updated too)")
+                   help="r2: allow public signatures to change (callers are updated too); "
+                        "r6: also remove unreferenced functions from public headers")
     p.add_argument("--plan", action="store_true", help="r2: list the targets and prompt sizes, call no model")
     p.add_argument("--replay", type=Path, default=None, help="r2: answer from a recording instead of a live model")
     p.add_argument("--record", type=Path, default=None, help="r2: append every model answer to this file")

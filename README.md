@@ -3,13 +3,14 @@
 An LSP-powered agent that modernizes legacy C++ (C++11/14 → C++20) in small,
 verified, reversible change-sets, and delivers the result as a reviewable branch.
 
-**Status:** Two recipes work end to end:
+**Status:** Three recipes work end to end:
 
 - **R1, mechanical** (no LLM): `nullptr`, `override`, range-for, `using`, `= delete`, C++ casts, from `clang-tidy` fix-its.
 - **R2, ownership** (LLM): manual `lock`/`unlock` → `lock_guard`, `FILE*` → RAII, raw owning pointers and `delete` → `unique_ptr`.
+- **R6, dead code** (no LLM): `#if 0` blocks, stale flag branches, constant-folded `if`s, unused includes and unused internal functions are removed; unreferenced public functions are reported.
 
 Every edit, whoever wrote it, must pass the same gates before it is committed.
-Dead code, macros, SFINAE and C++20 library recipes come next.
+Macros, SFINAE and C++20 library recipes come next.
 
 ## Why it is built this way
 
@@ -89,6 +90,14 @@ refactor-pilot run fixtures/legacy_inventory --recipe r2 --replay examples/repla
 refactor-pilot run fixtures/legacy_inventory --recipe r2 --record my-run.jsonl
 ```
 
+```bash
+# Recipe R6 (dead code). Declare a flag stale to have its branches removed.
+refactor-pilot run fixtures/legacy_inventory --recipe r6 --flag INVENTORY_ENABLE_LEGACY_PRICING=off
+
+# Several recipes in order on one branch
+refactor-pilot run fixtures/legacy_inventory --recipe r1,r6
+```
+
 R2 finds its targets deterministically (regex plus `clangd`), asks the model for
 one edit per target as SEARCH/REPLACE blocks, and checks the answer four ways:
 the edit must apply exactly, the legacy pattern must be gone, public signatures
@@ -155,7 +164,9 @@ src/refactor_pilot/
   checkpoint.py    private git worktree: commit, rollback, cherry-pick
   gates.py         fast gate and full gate, with feedback text for retries
   session.py       executor loop: apply -> verify -> commit or roll back; culprit search
-  recipes/         r1_mechanical.py (clang-tidy fix-its), r2_ownership.py (LLM, RAII)
+  recipes/         r1_mechanical.py (clang-tidy fix-its), r2_ownership.py (LLM, RAII),
+                   r6_dead_code.py (tiered pruning)
+  preproc.py       text-level helpers: #if groups, brace matching, constant folding
   llm/             chat client: budget, backoff, record, replay
   edits.py         SEARCH/REPLACE edit format: parse and apply exactly
   lsp/             JSON-RPC framing, position conversion, clangd client
