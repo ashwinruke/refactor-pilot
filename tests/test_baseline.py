@@ -41,3 +41,22 @@ def test_roundtrip(tmp_path):
     s = snap({"a.cpp|-Wx|m": 1}, {"t": "pass"}, {"t": "pass"})
     s.save(tmp_path / "b.json")
     assert Snapshot.load(tmp_path / "b.json") == s
+
+
+def test_reworded_warning_is_not_a_new_warning():
+    """Changing a type rewrites the text of an existing warning; that is not a regression."""
+    before = snap({"w.cpp|-Wsign-compare|comparison of 'int' and 'vector<Item*>::size_type'": 1})
+    after = snap({"w.cpp|-Wsign-compare|comparison of 'int' and 'vector<unique_ptr<Item>>::size_type'": 1})
+    assert compare(before, after).ok
+
+
+def test_extra_warning_of_the_same_kind_in_the_same_file_is_caught():
+    before = snap({"w.cpp|-Wsign-compare|old text": 1})
+    after = snap({"w.cpp|-Wsign-compare|new text": 1, "w.cpp|-Wsign-compare|another": 1})
+    reg = compare(before, after)
+    assert sum(reg.new_warnings.values()) == 1
+
+
+def test_same_flag_in_a_different_file_is_new():
+    before = snap({"a.cpp|-Wx|m": 1})
+    assert compare(before, snap({"b.cpp|-Wx|m": 1})).new_warnings == {"b.cpp|-Wx|m": 1}

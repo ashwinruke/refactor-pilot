@@ -55,6 +55,45 @@ class Regressions:
         return lines
 
 
+def _new_warnings(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    """Warnings that are new, counted per (file, warning flag).
+
+    The message text is not part of the identity. Compilers put type names in
+    messages, so an edit that changes a type rewords an old warning without
+    adding one: "comparison of 'int' and 'vector<Item*>::size_type'" becomes
+    "... 'vector<unique_ptr<Item>>::size_type'". Counting per file and flag sees
+    that as the same single warning; the reworded message is only used to
+    describe a real increase.
+    """
+    def group(key: str) -> tuple[str, str]:
+        file, flag, _ = key.split("|", 2)
+        return file, flag
+
+    totals_before: dict[tuple[str, str], int] = {}
+    for key, count in before.items():
+        totals_before[group(key)] = totals_before.get(group(key), 0) + count
+    totals_after: dict[tuple[str, str], int] = {}
+    for key, count in after.items():
+        totals_after[group(key)] = totals_after.get(group(key), 0) + count
+
+    new: dict[str, int] = {}
+    for grp, total in totals_after.items():
+        extra = total - totals_before.get(grp, 0)
+        if extra <= 0:
+            continue
+        # Attribute the increase to the messages that actually grew.
+        grown = sorted(
+            ((count - before.get(key, 0), key) for key, count in after.items() if group(key) == grp),
+            reverse=True,
+        )
+        for increase, key in grown:
+            if extra <= 0 or increase <= 0:
+                break
+            new[key] = min(increase, extra)
+            extra -= new[key]
+    return dict(sorted(new.items()))
+
+
 def _test_regressions(before: dict[str, str], after: dict[str, str]) -> tuple[list[str], list[str]]:
     broken = [t for t, r in before.items() if r == "pass" and after.get(t) == "fail"]
     # Deleting a test must never count as fixing it.
@@ -64,10 +103,7 @@ def _test_regressions(before: dict[str, str], after: dict[str, str]) -> tuple[li
 
 def compare(before: Snapshot, after: Snapshot) -> Regressions:
     reg = Regressions()
-    for key, count in after.warnings.items():
-        extra = count - before.warnings.get(key, 0)
-        if extra > 0:
-            reg.new_warnings[key] = extra
+    reg.new_warnings = _new_warnings(before.warnings, after.warnings)
     reg.broken_tests, reg.missing_tests = _test_regressions(before.tests, after.tests)
     if before.sanitizer_tests is not None and after.sanitizer_tests is not None:
         reg.broken_sanitizer_tests, reg.missing_sanitizer_tests = _test_regressions(

@@ -7,7 +7,7 @@ Commands:
   symbols   list the symbols declared in one file (via clangd)
   refs      show a symbol's signature, callers and every reference (via clangd)
   apply     push patches through the verification gates onto a new branch
-  run       run a modernization recipe (r1: mechanical fixes via clang-tidy)
+  run       run a modernization recipe (r1: mechanical via clang-tidy; r2: ownership via an LLM)
 """
 
 from __future__ import annotations
@@ -23,7 +23,8 @@ from .checkpoint import CheckpointError
 from .evalkit import score as scoremod
 from .lsp import LspError
 from .navigator import SymbolNavigator
-from .recipes import r1_mechanical
+from .llm import Budget, LlmError, RecordingClient, ReplayClient, client_from_env
+from .recipes import r1_mechanical, r2_ownership
 from .session import ChangeSet, Session
 from .toolchain import ToolMissing
 
@@ -160,9 +161,10 @@ def _print_report(report, show_unchanged: bool = True) -> int:
         if outcome.reason:
             print(f"{'':<21} reason: {outcome.reason}")
     kept = report.count("committed")
+    skipped = f", {report.count('skipped')} skipped" if report.count("skipped") else ""
     print(
         f"\n{kept} committed, {report.count('rolled_back')} rolled back, {report.count('reverted')} reverted, "
-        f"{report.count('no_change')} unchanged; {report.full_gates} full-gate runs; {report.seconds:.0f}s"
+        f"{report.count('no_change')} unchanged{skipped}; {report.full_gates} full-gate runs; {report.seconds:.0f}s"
     )
     if kept:
         print(f"result is on branch '{report.branch}'. Your working tree was not touched.")
@@ -174,30 +176,76 @@ def _print_report(report, show_unchanged: bool = True) -> int:
     return kept
 
 
+def _llm_client(args: argparse.Namespace):
+    if args.replay:
+        return ReplayClient.from_file(args.replay)
+    client = client_from_env(Budget(max_requests=args.max_requests))
+    return RecordingClient(client, args.record) if args.record else client
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     checks = [c.strip() for c in args.checks.split(",") if c.strip()] if args.checks else None
+    client = _llm_client(args) if args.recipe == "r2" and not args.plan else None
     session = Session(
         args.repo, work_dir=args.work_dir, compiler=args.compiler, branch=args.branch,
         sanitizers=not args.no_sanitizers, full_every=args.full_every,
         allow_dirty=args.allow_dirty, keep_worktree=args.keep_worktree,
         log=lambda message: print(f"  {message}", flush=True),
     )
+    stopped = ""
     with session:
         print(f"branch {session.workspace.branch} (private worktree: {session.workspace.worktree})")
-        findings_before = len(buildmod.run_tidy(session.cfg, session.build_dir))
         score_before = scoremod.score(session.workspace.repo, args.manifest) if args.manifest else None
-        r1_mechanical.run(session, checks)
+        if args.recipe == "r2" and args.plan:
+            return _print_r2_plan(session, args.allow_api_changes)
+        if args.recipe == "r1":
+            findings_before = len(buildmod.run_tidy(session.cfg, session.build_dir))
+            r1_mechanical.run(session, checks)
+        else:
+            if isinstance(client, ReplayClient):
+                print(f"  model: replaying {args.replay} (no network, no key)")
+            else:
+                inner = client.inner if isinstance(client, RecordingClient) else client
+                print(f"  model: {inner.model} via {inner.base_url}; budget {inner.budget.max_requests} requests")
+            stopped = r2_ownership.run(
+                session, client, allow_api_changes=args.allow_api_changes, max_attempts=args.max_attempts,
+                log=lambda message: print(f"  {message}", flush=True),
+            ).stopped
         session.checkpoint()  # settle everything before measuring
-        findings_after = len(buildmod.run_tidy(session.cfg, session.build_dir))
+        if args.recipe == "r1":
+            findings_after = len(buildmod.run_tidy(session.cfg, session.build_dir))
         score_after = scoremod.score(session.workspace.repo, args.manifest) if args.manifest else None
-    _print_report(session.report, show_unchanged=args.verbose)
-    print(f"\nclang-tidy modernize findings: {findings_before} -> {findings_after}")
+    _print_report(session.report, show_unchanged=args.verbose or args.recipe == "r2")
+    print()
+    if args.recipe == "r1":
+        print(f"clang-tidy modernize findings: {findings_before} -> {findings_after}")
+    else:
+        print(f"model usage: {client.budget.requests} requests, {client.budget.tokens} tokens")
+        if stopped:
+            print(f"stopped early: {stopped}")
     if score_after is not None:
         print(f"manifest score: {len(score_before.resolved)}/{score_before.total} -> "
               f"{len(score_after.resolved)}/{score_after.total} legacy constructs resolved")
         for recipe, (done, total) in score_after.by_recipe.items():
             was = score_before.by_recipe[recipe][0]
             print(f"  {recipe}: {was}/{total} -> {done}/{total}")
+    return 0
+
+
+def _print_r2_plan(session: Session, allow_api_changes: bool) -> int:
+    """List what R2 would work on, and how big each prompt is. Calls no model."""
+    cfg = session.cfg
+    with SymbolNavigator(cfg) as nav:
+        targets = r2_ownership.find_targets(nav, cfg.repo, buildmod.source_files(cfg, session.build_dir), allow_api_changes)
+    standard = r2_ownership.language_standard(session.build_dir)
+    print(f"\n{len(targets)} target(s); standard: {standard or 'compiler default'}; "
+          f"API changes {'allowed' if allow_api_changes else 'not allowed'}\n")
+    for target in targets:
+        prompt, editable = r2_ownership.build_prompt(target, cfg.repo, standard, allow_api_changes)
+        note = "  [skipped without --allow-api-changes]" if target.needs_api_change and not allow_api_changes else ""
+        print(f"{target.id}{note}")
+        print(f"    may edit: {', '.join(sorted(editable))}")
+        print(f"    prompt:   {len(prompt)} characters (about {len(prompt) // 4} tokens)")
     return 0
 
 
@@ -252,8 +300,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", help="run a modernization recipe on a new branch")
     p.add_argument("repo", type=Path, help="path to a CMake project inside a git repository")
-    p.add_argument("--recipe", choices=["r1"], default="r1", help="r1: mechanical fixes via clang-tidy")
-    p.add_argument("--checks", default=None, help="comma-separated clang-tidy checks (default: the R1 list)")
+    p.add_argument("--recipe", choices=["r1", "r2"], default="r1",
+                   help="r1: mechanical fixes via clang-tidy; r2: ownership and RAII via an LLM")
+    p.add_argument("--checks", default=None, help="r1: comma-separated clang-tidy checks (default: the R1 list)")
+    p.add_argument("--allow-api-changes", action="store_true",
+                   help="r2: allow public signatures to change (callers are updated too)")
+    p.add_argument("--plan", action="store_true", help="r2: list the targets and prompt sizes, call no model")
+    p.add_argument("--replay", type=Path, default=None, help="r2: answer from a recording instead of a live model")
+    p.add_argument("--record", type=Path, default=None, help="r2: append every model answer to this file")
+    p.add_argument("--max-requests", type=int, default=40, help="r2: hard cap on model requests for this run")
+    p.add_argument("--max-attempts", type=int, default=3, help="r2: attempts per target before giving up")
     p.add_argument("--manifest", type=Path, default=None, help="benchmark manifest; prints the score before and after")
     p.add_argument("--branch", default=None)
     p.add_argument("--full-every", type=int, default=5)
@@ -277,7 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)
-    except (ToolMissing, LspError, CheckpointError) as exc:
+    except (ToolMissing, LspError, CheckpointError, LlmError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except BuildFailed as exc:

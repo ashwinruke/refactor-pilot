@@ -28,15 +28,27 @@ class ChangeSet:
     """One atomic edit: a definition and all its references, or one codemod.
 
     `apply(repo, feedback)` edits files under `repo`. On a retry, `feedback` is
-    the previous gate failure as text (compiler errors, failing tests); on the
-    first attempt it is None. Deterministic edits can ignore it; the Phase 4
-    agent will use it.
+    why the previous attempt was rejected, as text (an edit that would not
+    apply, compiler errors, failing tests, an unmet goal); on the first attempt
+    it is None. Deterministic edits ignore it; the agent reads it.
+
+    Optional:
+      max_attempts  overrides the session's retry limit for this change-set
+      gate          "fast" (default) or "full": which gate decides accept/retry.
+                    Ownership edits use "full", because only the sanitizers can
+                    see a leak or a double free, and the model should get that
+                    feedback while it can still retry.
+      accept        goal check run before the gate. Returns None when the edit
+                    did what was asked, else a message explaining what is missing.
     """
 
     id: str
     description: str
     apply: Callable[[Path, str | None], None]
     no_change_reason: str = "the edit changed nothing"
+    max_attempts: int | None = None
+    gate: str = "fast"
+    accept: Callable[[Path], str | None] | None = None
 
 
 @dataclass
@@ -152,31 +164,57 @@ class Session:
         outcome = Outcome(change.id, change.description, "rolled_back")
         self.outcomes.append(outcome)
         feedback: str | None = None
-        for attempt in range(1, self.max_attempts + 1):
+        attempts = change.max_attempts or self.max_attempts
+        for attempt in range(1, attempts + 1):
             outcome.attempts = attempt
             try:
                 change.apply(ws.repo, feedback)
             except Exception as exc:  # a broken edit must never take the session down
                 ws.rollback()
-                outcome.reason = f"could not apply: {exc}"
-                break
+                outcome.reason = f"could not apply: {exc}".splitlines()[0][:300]
+                if getattr(exc, "fatal", False):  # e.g. budget spent: stop the whole recipe
+                    outcome.seconds = time.monotonic() - start
+                    self._log(f"{outcome.status:<11} {change.id}  ({outcome.reason})")
+                    raise
+                feedback = f"Your edit could not be applied.\n{exc}"
+                self._attempt_failed(change, attempt, attempts, outcome.reason)
+                continue
             outcome.files = ws.changed_files()
             if not outcome.files:
                 outcome.status, outcome.reason = "no_change", change.no_change_reason
                 break
-            gate = self.verifier.fast()
+            problem = change.accept(ws.repo) if change.accept else None
+            if problem:
+                ws.rollback()
+                outcome.reason, feedback = " ".join(f"goal not met: {problem}".split())[:300], problem
+                self._attempt_failed(change, attempt, attempts, outcome.reason)
+                continue
+            if change.gate == "full":
+                self._full_gates += 1
+                gate = self.verifier.full()
+            else:
+                gate = self.verifier.fast()
             if gate.ok:
                 outcome.sha = ws.commit(f"{change.id}: {change.description}")
                 outcome.status, outcome.reason = "committed", ""
-                self._pending.append(outcome)
+                if change.gate == "full":
+                    # A full pass at this commit also covers everything before it.
+                    self._pending, self._last_green = [], outcome.sha
+                else:
+                    self._pending.append(outcome)
                 break
             ws.rollback()
             outcome.reason, feedback = gate.summary(), gate.feedback()
+            self._attempt_failed(change, attempt, attempts, outcome.reason)
         outcome.seconds = time.monotonic() - start
         self._log(f"{outcome.status:<11} {change.id}" + (f"  ({outcome.reason})" if outcome.reason else ""))
         if len(self._pending) >= self.full_every:
             self.checkpoint()
         return outcome
+
+    def _attempt_failed(self, change: ChangeSet, attempt: int, attempts: int, reason: str) -> None:
+        if attempts > 1:  # only worth a line when there is a retry to explain
+            self._log(f"  attempt {attempt}/{attempts} of {change.id} rejected: {reason}")
 
     def _full(self) -> GateResult:
         self._full_gates += 1
