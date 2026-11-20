@@ -40,6 +40,11 @@ class ChangeSet:
                     feedback while it can still retry.
       accept        goal check run before the gate. Returns None when the edit
                     did what was asked, else a message explaining what is missing.
+      rebaseline    for edits that legitimately change what the compiler reports
+                    (raising the language standard). The tree must still build
+                    and every test must still pass, sanitizers included, but the
+                    set of warnings is allowed to change and becomes the new
+                    baseline for everything after it.
     """
 
     id: str
@@ -49,6 +54,7 @@ class ChangeSet:
     max_attempts: int | None = None
     gate: str = "fast"
     accept: Callable[[Path], str | None] | None = None
+    rebaseline: bool = False
 
 
 @dataclass
@@ -103,6 +109,7 @@ class Session:
         self._last_green = ""
         self._full_gates = 0
         self._started = 0.0
+        self.warning_shift = 0  # warnings gained (+) or lost (-) at the last re-baseline
 
     @property
     def cfg(self) -> BuildConfig:
@@ -189,7 +196,15 @@ class Session:
                 outcome.reason, feedback = " ".join(f"goal not met: {problem}".split())[:300], problem
                 self._attempt_failed(change, attempt, attempts, outcome.reason)
                 continue
-            if change.gate == "full":
+            if change.rebaseline:
+                problem = self._rebaseline()
+                if problem:
+                    ws.rollback()
+                    outcome.reason, feedback = problem, problem
+                    self._attempt_failed(change, attempt, attempts, outcome.reason)
+                    continue
+                gate = GateResult("full", ok=True)
+            elif change.gate == "full":
                 self._full_gates += 1
                 gate = self.verifier.full()
             else:
@@ -197,7 +212,7 @@ class Session:
             if gate.ok:
                 outcome.sha = ws.commit(f"{change.id}: {change.description}")
                 outcome.status, outcome.reason = "committed", ""
-                if change.gate == "full":
+                if change.gate == "full" or change.rebaseline:
                     # A full pass at this commit also covers everything before it.
                     self._pending, self._last_green = [], outcome.sha
                 else:
@@ -211,6 +226,28 @@ class Session:
         if len(self._pending) >= self.full_every:
             self.checkpoint()
         return outcome
+
+    def _rebaseline(self) -> str | None:
+        """Take a fresh snapshot and adopt it, provided the tests did not regress.
+
+        Returns None on success, else why the tree was not acceptable.
+        """
+        from .baseline import compare
+        from .build import BuildFailed
+
+        old = self.verifier.baseline
+        try:
+            new = self.verifier.snapshot()
+        except BuildFailed as exc:
+            return f"compile: {exc}"
+        self._full_gates += 1
+        regressions = compare(old, new)
+        regressions.new_warnings = {}  # allowed to change; that is the point
+        if not regressions.ok:
+            return "tests: " + "; ".join(regressions.describe()[:3])
+        self.warning_shift = sum(new.warnings.values()) - sum(old.warnings.values())
+        self.verifier.set_baseline(new)
+        return None
 
     def _attempt_failed(self, change: ChangeSet, attempt: int, attempts: int, reason: str) -> None:
         if attempts > 1:  # only worth a line when there is a retry to explain

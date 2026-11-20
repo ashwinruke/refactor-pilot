@@ -3,14 +3,20 @@
 An LSP-powered agent that modernizes legacy C++ (C++11/14 → C++20) in small,
 verified, reversible change-sets, and delivers the result as a reviewable branch.
 
-**Status:** Three recipes work end to end:
+**Status:** All recipes work end to end. On the bundled fixture the
+full pipeline resolves **32 of 32** planted legacy constructs in 43 verified commits.
 
-- **R1, mechanical** (no LLM): `nullptr`, `override`, range-for, `using`, `= delete`, C++ casts, from `clang-tidy` fix-its.
-- **R2, ownership** (LLM): manual `lock`/`unlock` → `lock_guard`, `FILE*` → RAII, raw owning pointers and `delete` → `unique_ptr`.
-- **R6, dead code** (no LLM): `#if 0` blocks, stale flag branches, constant-folded `if`s, unused includes and unused internal functions are removed; unreferenced public functions are reported.
+| Recipe | What it does | Engine |
+|---|---|---|
+| `std` | Raises the project's C++ standard (default C++20) | CMake edit, re-baselined |
+| `r1` | `nullptr`, `override`, range-for, `using`, `= delete`, casts; at C++20 also `enable_if` → `requires`, `starts_with` | `clang-tidy` fix-its |
+| `r2` | Manual `lock`/`unlock` → `lock_guard`, `FILE*` → RAII, raw owning pointers → `unique_ptr` | LLM |
+| `r3` | Value and function macros → `constexpr`; unscoped enums → `enum class` | LLM |
+| `r4` | Remaining SFINAE → concepts | LLM |
+| `r5` | `snprintf` buffers → `std::format`, pointer+length → `std::span`, prefix tests → `starts_with` | LLM |
+| `r6` | Dead code: `#if 0`, stale flags, constant `if`s, unused includes and functions | Text + `clangd` |
 
 Every edit, whoever wrote it, must pass the same gates before it is committed.
-Macros, SFINAE and C++20 library recipes come next.
 
 ## Why it is built this way
 
@@ -98,7 +104,18 @@ refactor-pilot run fixtures/legacy_inventory --recipe r6 --flag INVENTORY_ENABLE
 refactor-pilot run fixtures/legacy_inventory --recipe r1,r6
 ```
 
-R2 finds its targets deterministically (regex plus `clangd`), asks the model for
+```bash
+# Everything, in the recommended order (std,r1,r6,r2,r3,r4,r5); needs an API key for r2-r5
+refactor-pilot run fixtures/legacy_inventory --recipe all
+
+# The whole pipeline from a recording: no network, no key, 32/32
+refactor-pilot run fixtures/legacy_inventory --recipe std,r2,r3,r4,r5,r1,r6 --allow-api-changes \
+    --flag INVENTORY_ENABLE_LEGACY_PRICING=off --replay examples/replays/full-fixture-api.jsonl \
+    --manifest fixtures/legacy_inventory/manifest.json
+```
+
+The model-written recipes (R2–R5) share one engine. It finds targets
+deterministically (regex plus `clangd`), asks the model for
 one edit per target as SEARCH/REPLACE blocks, and checks the answer four ways:
 the edit must apply exactly, the legacy pattern must be gone, public signatures
 must be unchanged (unless `--allow-api-changes`), and the full gate including
@@ -125,7 +142,7 @@ It builds with two known warnings and five passing tests, on purpose: that is th
 
 ## LLM provider
 
-Only recipe R2 uses a model. It talks to any **OpenAI-compatible chat-completions
+Recipes R2–R5 use a model. It talks to any **OpenAI-compatible chat-completions
 endpoint**, so the provider is configuration, not code:
 
 ```bash
@@ -164,8 +181,8 @@ src/refactor_pilot/
   checkpoint.py    private git worktree: commit, rollback, cherry-pick
   gates.py         fast gate and full gate, with feedback text for retries
   session.py       executor loop: apply -> verify -> commit or roll back; culprit search
-  recipes/         r1_mechanical.py (clang-tidy fix-its), r2_ownership.py (LLM, RAII),
-                   r6_dead_code.py (tiered pruning)
+  recipes/         std_raise.py, r1_mechanical.py (clang-tidy), r6_dead_code.py (tiers),
+                   llm_engine.py (shared by r2-r5: kinds, planning, prompts, checks)
   preproc.py       text-level helpers: #if groups, brace matching, constant folding
   llm/             chat client: budget, backoff, record, replay
   edits.py         SEARCH/REPLACE edit format: parse and apply exactly

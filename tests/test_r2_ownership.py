@@ -2,6 +2,7 @@
 
 import json
 import shutil
+from collections import Counter
 import subprocess
 from pathlib import Path
 
@@ -65,10 +66,24 @@ def _accept(target, before, after, allow, tmp_path):
 
 
 def test_accept_requires_the_pattern_to_be_gone(tmp_path):
-    target = r2.Target("manual-lock", "L", "class", ["l.cpp"])
-    before = {"l.cpp": "void f() { m.lock(); x(); m.unlock(); }\n"}
-    assert "still present" in _accept(target, before, {"l.cpp": "void f() { m.lock(); x(); }\n"}, False, tmp_path)
-    assert _accept(target, before, {"l.cpp": "void f() { std::lock_guard<std::mutex> g(m); x(); }\n"}, False, tmp_path) is None
+    before = {"l.cpp": "void f() {\n    m.lock();\n    x();\n    m.unlock();\n}\n"}
+    target = r2.Target("manual-lock", "L", "class", ["l.cpp"],
+                       must_go={"l.cpp": Counter({"m.lock();": 1, "m.unlock();": 1})})
+    half = {"l.cpp": "void f() {\n    std::lock_guard<std::mutex> g(m);\n    x();\n    m.unlock();\n}\n"}
+    assert "still present" in _accept(target, before, half, False, tmp_path)
+    reworded = {"l.cpp": "void f() {\n    m.lock( );\n    x();\n    m.unlock( );\n}\n"}
+    assert "still present" in _accept(target, before, reworded, False, tmp_path)
+    done = {"l.cpp": "void f() {\n    std::lock_guard<std::mutex> g(m);\n    x();\n}\n"}
+    assert _accept(target, before, done, False, tmp_path) is None
+
+
+def test_accept_counts_only_the_targets_own_lines(tmp_path):
+    """Two classes in one file both `delete p_;`. Fixing one must not be blocked by the other."""
+    before = {"two.cpp": "A::~A() {\n    delete p_;\n}\nB::~B() {\n    delete p_;\n}\n"}
+    target = r2.Target("raw-ownership", "A", "class", ["two.cpp"], must_go={"two.cpp": Counter({"delete p_;": 1})})
+    one_fixed = {"two.cpp": "A::~A() {\n}\nB::~B() {\n    delete p_;\n}\n"}
+    assert _accept(target, before, one_fixed, False, tmp_path) is None
+    assert "still present" in _accept(target, before, before, False, tmp_path)
 
 
 def test_accept_rejects_a_public_signature_change_unless_allowed(tmp_path):

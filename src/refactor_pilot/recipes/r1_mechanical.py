@@ -38,6 +38,16 @@ DEFAULT_CHECKS = [
     "modernize-return-braced-init-list",
     "modernize-use-noexcept",
     "google-readability-casting",
+    # The checks below need a newer standard. clang-tidy stays silent about them
+    # until the project compiles in that mode, so listing them costs nothing at
+    # C++11 and takes effect once the `std` recipe has run.
+    "modernize-make-unique",                 # C++14
+    "modernize-make-shared",
+    "modernize-use-constraints",             # C++20: enable_if -> requires
+    "modernize-type-traits",                 # C++14/17: _t and _v forms
+    "modernize-use-starts-ends-with",        # C++20
+    "modernize-use-std-numbers",             # C++20
+    "readability-container-contains",        # C++20
 ]
 # Deliberately not here:
 #   modernize-macro-to-enum, modernize-avoid-c-arrays  -> recipe R3/R5 (need judgement)

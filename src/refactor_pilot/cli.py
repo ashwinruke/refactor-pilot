@@ -7,7 +7,7 @@ Commands:
   symbols   list the symbols declared in one file (via clangd)
   refs      show a symbol's signature, callers and every reference (via clangd)
   apply     push patches through the verification gates onto a new branch
-  run       run recipes: r1 mechanical (clang-tidy), r2 ownership (LLM), r6 dead code
+  run       run recipes on a new branch: std, r1..r6, or all
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from .evalkit import score as scoremod
 from .lsp import LspError
 from .navigator import SymbolNavigator
 from .llm import Budget, LlmError, RecordingClient, ReplayClient, client_from_env
-from .recipes import r1_mechanical, r2_ownership, r6_dead_code
+from .recipes import llm_engine, r1_mechanical, r6_dead_code, std_raise
 from .session import ChangeSet, Session
 from .toolchain import ToolMissing
 
@@ -183,7 +183,17 @@ def _llm_client(args: argparse.Namespace):
     return RecordingClient(client, args.record) if args.record else client
 
 
-RECIPES = ("r1", "r2", "r6")
+RECIPES = {
+    "std": "raise the C++ standard (default C++20)",
+    "r1": "mechanical fixes from clang-tidy",
+    "r2": "ownership and RAII (LLM)",
+    "r3": "macros to constexpr, enum class (LLM)",
+    "r4": "SFINAE to concepts (LLM; clang-tidy in r1 does most of it at C++20)",
+    "r5": "C++20 library: std::format, std::span, starts_with (LLM)",
+    "r6": "dead-code pruning",
+}
+ALL = ["std", "r1", "r6", "r2", "r3", "r4", "r5"]
+LLM_RECIPES = ("r2", "r3", "r4", "r5")
 
 
 def _parse_flags(items: list[str]) -> dict[str, bool]:
@@ -196,15 +206,30 @@ def _parse_flags(items: list[str]) -> dict[str, bool]:
     return flags
 
 
+def _parse_recipes(text: str) -> list[str] | None:
+    recipes: list[str] = []
+    for name in (r.strip().lower() for r in text.split(",") if r.strip()):
+        if name == "all":
+            recipes += ALL
+        elif name in RECIPES:
+            recipes.append(name)
+        else:
+            print(f"error: unknown recipe '{name}'. Choose from: {', '.join(RECIPES)}, all", file=sys.stderr)
+            return None
+    if not recipes:
+        print(f"error: no recipe given. Choose from: {', '.join(RECIPES)}, all", file=sys.stderr)
+        return None
+    return recipes
+
+
 def cmd_run(args: argparse.Namespace) -> int:
-    recipes = [r.strip() for r in args.recipe.split(",") if r.strip()]
-    unknown = [r for r in recipes if r not in RECIPES]
-    if unknown or not recipes:
-        print(f"error: unknown recipe '{(unknown or [''])[0]}'. Choose from: {', '.join(RECIPES)}", file=sys.stderr)
+    recipes = _parse_recipes(args.recipe)
+    if recipes is None:
         return 2
     checks = [c.strip() for c in args.checks.split(",") if c.strip()] if args.checks else None
     flags = _parse_flags(args.flag)
-    client = _llm_client(args) if "r2" in recipes and not args.plan else None
+    model_recipes = [r for r in recipes if r in LLM_RECIPES]
+    client = _llm_client(args) if model_recipes and not args.plan else None
     log = lambda message: print(f"  {message}", flush=True)  # noqa: E731
     session = Session(
         args.repo, work_dir=args.work_dir, compiler=args.compiler, branch=args.branch,
@@ -216,27 +241,35 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"branch {session.workspace.branch} (private worktree: {session.workspace.worktree})")
         score_before = scoremod.score(session.workspace.repo, args.manifest) if args.manifest else None
         if args.plan:
-            return _print_r2_plan(session, args.allow_api_changes)
+            kinds = tuple(k for r in (model_recipes or LLM_RECIPES) for k in llm_engine.RECIPE_KINDS[r])
+            return _print_plan(session, args.allow_api_changes, kinds)
         findings_before = len(buildmod.run_tidy(session.cfg, session.build_dir)) if "r1" in recipes else 0
+        if client is not None:
+            if isinstance(client, ReplayClient):
+                print(f"  model: replaying {args.replay} (no network, no key)")
+            else:
+                inner = client.inner if isinstance(client, RecordingClient) else client
+                print(f"  model: {inner.model} via {inner.base_url}; budget {inner.budget.max_requests} requests")
+        stopped = ""
         for recipe in recipes:
-            print(f"  -- recipe {recipe}")
-            if recipe == "r1":
+            print(f"  -- recipe {recipe}: {RECIPES[recipe]}")
+            if recipe == "std":
+                std_raise.run(session, args.std, log=log)
+            elif recipe == "r1":
                 r1_mechanical.run(session, checks)
             elif recipe == "r6":
                 dead = r6_dead_code.run(session, flags, allow_api_changes=args.allow_api_changes, log=log)
                 for name in dead.flag_candidates:
                     notes.append(f"flag never defined in this build: {name}  (to remove its branches: --flag {name}=off)")
-            elif recipe == "r2":
-                if isinstance(client, ReplayClient):
-                    print(f"  model: replaying {args.replay} (no network, no key)")
-                else:
-                    inner = client.inner if isinstance(client, RecordingClient) else client
-                    print(f"  model: {inner.model} via {inner.base_url}; budget {inner.budget.max_requests} requests")
-                stopped = r2_ownership.run(
-                    session, client, allow_api_changes=args.allow_api_changes, max_attempts=args.max_attempts, log=log,
+            elif stopped:
+                print(f"  skipped: the model is unavailable ({stopped})")
+            else:
+                stopped = llm_engine.run(
+                    session, client, allow_api_changes=args.allow_api_changes, max_attempts=args.max_attempts,
+                    kinds=llm_engine.RECIPE_KINDS[recipe], log=log,
                 ).stopped
-                if stopped:
-                    notes.append(f"stopped early: {stopped}")
+        if stopped:
+            notes.append(f"stopped early: {stopped}")
         session.checkpoint()  # settle everything before measuring
         findings_after = len(buildmod.run_tidy(session.cfg, session.build_dir)) if "r1" in recipes else 0
         score_after = scoremod.score(session.workspace.repo, args.manifest) if args.manifest else None
@@ -257,17 +290,27 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _print_r2_plan(session: Session, allow_api_changes: bool) -> int:
-    """List what R2 would work on, and how big each prompt is. Calls no model."""
+def _print_plan(session: Session, allow_api_changes: bool, kinds: tuple[str, ...]) -> int:
+    """List what the model-written recipes would work on, and how big each prompt is. Calls no model."""
     cfg = session.cfg
+    sources = buildmod.source_files(cfg, session.build_dir)
     with SymbolNavigator(cfg) as nav:
-        targets = r2_ownership.find_targets(nav, cfg.repo, buildmod.source_files(cfg, session.build_dir), allow_api_changes)
-    standard = r2_ownership.language_standard(session.build_dir)
+        targets = llm_engine.find_targets(nav, cfg.repo, sources, allow_api_changes, kinds)
+    every = sorted({p.relative_to(cfg.repo).as_posix() for p in sources}
+                   | {p.relative_to(cfg.repo).as_posix() for p in cfg.repo.rglob("*") if p.suffix in llm_engine.HEADER_SUFFIXES})
+    context = llm_engine.repo_context(cfg.repo, every)
+    standard = llm_engine.language_standard(session.build_dir)
+    level = llm_engine.standard_number(standard)
     print(f"\n{len(targets)} target(s); standard: {standard or 'compiler default'}; "
           f"API changes {'allowed' if allow_api_changes else 'not allowed'}\n")
     for target in targets:
-        prompt, editable = r2_ownership.build_prompt(target, cfg.repo, standard, allow_api_changes)
-        note = "  [skipped without --allow-api-changes]" if target.needs_api_change and not allow_api_changes else ""
+        kind = llm_engine.KINDS[target.kind]
+        prompt, editable = llm_engine.build_prompt(target, cfg.repo, standard, allow_api_changes, context)
+        note = ""
+        if level < kind.min_standard:
+            note = f"  [skipped: needs C++{kind.min_standard}; add the std recipe]"
+        elif target.needs_api_change and not allow_api_changes:
+            note = "  [skipped without --allow-api-changes]"
         print(f"{target.id}{note}")
         print(f"    may edit: {', '.join(sorted(editable))}")
         print(f"    prompt:   {len(prompt)} characters (about {len(prompt) // 4} tokens)")
@@ -326,19 +369,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run", help="run a modernization recipe on a new branch")
     p.add_argument("repo", type=Path, help="path to a CMake project inside a git repository")
     p.add_argument("--recipe", default="r1",
-                   help="one or more of r1 (mechanical, clang-tidy), r2 (ownership, LLM), r6 (dead code); "
-                        "comma-separated to run several in order on one branch, e.g. r1,r6")
+                   help="std, r1, r2, r3, r4, r5, r6 or all; comma-separated to run several in order on one "
+                        "branch, e.g. std,r1,r6. 'all' is std,r1,r6,r2,r3,r4,r5")
+    p.add_argument("--std", type=int, default=20, choices=[14, 17, 20, 23],
+                   help="std: the C++ standard to raise the project to (default 20)")
     p.add_argument("--flag", action="append", default=[], metavar="NAME=on|off",
                    help="r6: declare a compile-time flag permanently on or off; its dead branches are removed")
     p.add_argument("--checks", default=None, help="r1: comma-separated clang-tidy checks (default: the R1 list)")
     p.add_argument("--allow-api-changes", action="store_true",
-                   help="r2: allow public signatures to change (callers are updated too); "
+                   help="r2-r5: allow public interfaces to change (callers are updated too); "
                         "r6: also remove unreferenced functions from public headers")
-    p.add_argument("--plan", action="store_true", help="r2: list the targets and prompt sizes, call no model")
-    p.add_argument("--replay", type=Path, default=None, help="r2: answer from a recording instead of a live model")
-    p.add_argument("--record", type=Path, default=None, help="r2: append every model answer to this file")
-    p.add_argument("--max-requests", type=int, default=40, help="r2: hard cap on model requests for this run")
-    p.add_argument("--max-attempts", type=int, default=3, help="r2: attempts per target before giving up")
+    p.add_argument("--plan", action="store_true", help="r2-r5: list the targets and prompt sizes, call no model")
+    p.add_argument("--replay", type=Path, default=None, help="r2-r5: answer from a recording instead of a live model")
+    p.add_argument("--record", type=Path, default=None, help="r2-r5: append every model answer to this file")
+    p.add_argument("--max-requests", type=int, default=40, help="r2-r5: hard cap on model requests for this run")
+    p.add_argument("--max-attempts", type=int, default=3, help="r2-r5: attempts per target before giving up")
     p.add_argument("--manifest", type=Path, default=None, help="benchmark manifest; prints the score before and after")
     p.add_argument("--branch", default=None)
     p.add_argument("--full-every", type=int, default=5)
