@@ -1,0 +1,49 @@
+{
+  "work_dir": "../.refactor-pilot/bench",
+  "targets": [
+    {
+      "name": "legacy_inventory",
+      "path": "../fixtures/legacy_inventory",
+      "manifest": "../fixtures/legacy_inventory/manifest.json",
+      "recipes": "std,r1,r6",
+      "flags": ["INVENTORY_ENABLE_LEGACY_PRICING=off"],
+      "status": "approved",
+      "note": "The bundled fixture. Deterministic recipes only, so it needs no API key."
+    },
+    {
+      "name": "tinyxml2",
+      "git": "https://github.com/leethomason/tinyxml2.git",
+      "ref": "6.2.0",
+      "commit": "c1424ee4e1c1ed8129d9147ccc920ab92dd9ef86",
+      "recipes": "r1,r6",
+      "cmake_args": ["-DBUILD_TESTS=ON", "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_STATIC_LIBS=ON", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"],
+      "prepare": [
+        {"file": "CMakeLists.txt", "find": "cmake_policy(SET CMP0063 OLD)", "replace": "# cmake_policy(SET CMP0063 OLD)  # CMake 4 refuses OLD policies"}
+      ],
+      "status": "proposed",
+      "note": "2018 release. One large test (xmltest). CRLF sources. Small and fast: about 40 seconds. Needs one CMake line disabled to configure under CMake 4."
+    },
+    {
+      "name": "jsoncpp",
+      "git": "https://github.com/open-source-parsers/jsoncpp.git",
+      "ref": "1.9.3",
+      "commit": "6aba23f4a8628d599a9ef7fa4811c4ff6e4070e2",
+      "recipes": "r1,r6",
+      "cmake_args": ["-DJSONCPP_WITH_POST_BUILD_UNITTEST=OFF", "-DBUILD_SHARED_LIBS=OFF", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"],
+      "status": "proposed",
+      "note": "2020 release, already partly modernized upstream. Three tests, one of them flaky when run in parallel. About 6 minutes."
+    },
+    {
+      "name": "leveldb",
+      "git": "https://github.com/google/leveldb.git",
+      "ref": "1.22",
+      "commit": "78b39d68c15ba020c0d60a3906fb66dbf1697595",
+      "recipes": "r1,r6",
+      "cmake_args": ["-DLEVELDB_BUILD_TESTS=ON", "-DLEVELDB_BUILD_BENCHMARKS=OFF", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"],
+      "test_timeout": 900,
+      "full_every": 20,
+      "status": "proposed",
+      "note": "2019 release. 30 tests, heavy use of raw pointers: the natural target for R2. Slow: a baseline alone takes about 7 minutes, a full run is hours."
+    }
+  ]
+}

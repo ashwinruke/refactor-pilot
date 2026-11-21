@@ -179,3 +179,4 @@ def test_all_expands_to_the_recommended_order(capsys):
     assert _parse_recipes("all") == ["std", "r1", "r6", "r2", "r3", "r4", "r5"]
     assert _parse_recipes("STD, r1") == ["std", "r1"]
     assert _parse_recipes("r1,nope") is None
+    assert "unknown recipe 'nope'" in capsys.readouterr().err

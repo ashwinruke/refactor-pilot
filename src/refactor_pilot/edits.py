@@ -18,6 +18,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import textio
+
 _BLOCK = re.compile(
     r"^<{5,} SEARCH[ \t]+(?P<path>\S+)[ \t]*\n"
     r"(?P<search>.*?)"
@@ -62,6 +64,7 @@ def apply(edits: list[Edit], repo: Path, allowed: set[str]) -> list[str]:
     """
     repo = Path(repo).resolve()
     contents: dict[str, str] = {}
+    originals: dict[str, tuple[str, str]] = {}  # rel -> (text as loaded, newline style)
     for number, edit in enumerate(edits, 1):
         rel = Path(edit.path).as_posix().lstrip("./")
         if rel not in allowed:
@@ -70,10 +73,13 @@ def apply(edits: list[Edit], repo: Path, allowed: set[str]) -> list[str]:
                 + ", ".join(sorted(allowed))
             )
         if rel not in contents:
-            contents[rel] = (repo / rel).read_text().replace("\r\n", "\n")
+            originals[rel] = textio.load(repo / rel)
+            contents[rel] = originals[rel][0]
         text = contents[rel]
         if edit.search == "":
             raise EditError(f"Block {number} ({rel}) has an empty SEARCH section.")
+        if originals[rel][1] == "mixed":  # match against LF text; the file itself is written back untouched elsewhere
+            text = text.replace("\r\n", "\n")
         count = text.count(edit.search)
         search = edit.search
         if count == 0:  # tolerate trailing-whitespace differences only
@@ -95,8 +101,8 @@ def apply(edits: list[Edit], repo: Path, allowed: set[str]) -> list[str]:
         contents[rel] = text.replace(search, edit.replace, 1)
     changed = []
     for rel, text in contents.items():
-        path = repo / rel
-        if path.read_text().replace("\r\n", "\n") != text:
-            path.write_text(text)
+        original, style = originals[rel]
+        if text != original:
+            textio.save(repo / rel, text, "lf" if style == "mixed" else style)
             changed.append(rel)
     return sorted(changed)

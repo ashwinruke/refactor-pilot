@@ -7,6 +7,7 @@ friendlier, repo-relative API lives in refactor_pilot.navigator.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -40,6 +41,7 @@ class ClangdClient:
         self._conn: Connection | None = None
         self._log = None
         self._versions: dict[str, int] = {}  # uri -> document version
+        self._sent: dict[str, str] = {}  # uri -> the text clangd currently has
         self._cond = threading.Condition()
         self._index_begun = False
         self._index_active = False
@@ -65,6 +67,7 @@ class ClangdClient:
             stdout=subprocess.PIPE,
             stderr=self._log,
             cwd=self.repo,
+            start_new_session=True,  # its own process group, so stop() can take helpers down with it
         )
         self._conn = Connection(self._proc.stdout, self._proc.stdin, self._on_notification, self._on_request)
         result = self._conn.request(
@@ -88,6 +91,19 @@ class ClangdClient:
         self._conn.notify("initialized", {})
         return self
 
+    def kill(self) -> None:
+        """Kill clangd and anything it started (some installs wrap the real binary in a launcher)."""
+        if self._proc is None:
+            return
+        try:
+            os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            self._proc.kill()
+        self._proc.wait()
+
+    def alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
     def stop(self) -> None:
         if self._conn is not None and self._proc is not None and self._proc.poll() is None:
             try:
@@ -99,8 +115,7 @@ class ClangdClient:
             try:
                 self._proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._proc.kill()
-                self._proc.wait()
+                self.kill()
         if self._log is not None:
             self._log.close()
         self._proc = self._conn = self._log = None
@@ -140,6 +155,7 @@ class ClangdClient:
         text = path.read_text(errors="replace")
         if uri not in self._versions:
             self._versions[uri] = 1
+            self._sent[uri] = text
             language = "cpp" if path.suffix.lower() != ".c" else "c"
             self._conn.notify(
                 "textDocument/didOpen",
@@ -153,15 +169,16 @@ class ClangdClient:
         uri = path_to_uri(path)
         if uri not in self._versions:
             return self.open(path)
+        text = path.read_text(errors="replace")
+        if self._sent.get(uri) == text:
+            return uri  # nothing changed (for example an edit that was rolled back); the cached state is current
         self._versions[uri] += 1
+        self._sent[uri] = text
         with self._cond:
             self._diagnostics.pop(uri, None)
         self._conn.notify(
             "textDocument/didChange",
-            {
-                "textDocument": {"uri": uri, "version": self._versions[uri]},
-                "contentChanges": [{"text": path.read_text(errors="replace")}],
-            },
+            {"textDocument": {"uri": uri, "version": self._versions[uri]}, "contentChanges": [{"text": text}]},
         )
         return uri
 

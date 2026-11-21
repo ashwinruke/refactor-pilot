@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 from typing import Callable
 
+from .. import textio
 from ..session import ChangeSet, Outcome, Session
 from .llm_engine import language_standard, standard_number
 
@@ -62,18 +63,19 @@ def run(session: Session, std: int = 20, log: Callable[[str], None] = lambda m: 
     def apply(repo_dir: Path, feedback: str | None) -> None:
         edited = 0
         for path in cmake_files(repo_dir):
-            text, count = raise_in_text(path.read_text(errors="replace"), std)
+            text, style = textio.load(path)
+            text, count = raise_in_text(text, std)
             if count:
-                path.write_text(text)
+                textio.save(path, text, style)
                 edited += count
         if not edited:  # nothing sets a standard: say so explicitly, once, at the top
             top = repo_dir / "CMakeLists.txt"
-            text = top.read_text(errors="replace")
+            text, style = textio.load(top)
             m = _PROJECT.search(text)
             if not m:
                 raise RuntimeError("no project() call found in the top-level CMakeLists.txt")
             line = f"set(CMAKE_CXX_STANDARD {std})\nset(CMAKE_CXX_STANDARD_REQUIRED ON)\n"
-            top.write_text(text[:m.end()] + line + text[m.end():])
+            textio.save(top, text[:m.end()] + line + text[m.end():], style)
         # A standard stored as a CMake cache variable keeps its old value in an
         # existing build tree, so tell this session's builds explicitly as well.
         if "-UCMAKE_CXX_STANDARD" in cfg.cmake_args:

@@ -26,6 +26,9 @@ class BuildFailed(RuntimeError):
         self.stage, self.result, self.errors = stage, result, errors
         first = errors[0] if errors else None
         hint = f" First error: {first.file}:{first.line}: {first.message}" if first else ""
+        if not hint and "CMake Error" in result.output:  # say what cmake said, on one line
+            block = result.output[result.output.index("CMake Error"):].split("\n\n")[0]
+            hint = " " + " ".join(block.split())[:260]
         super().__init__(f"{stage} failed with exit code {result.returncode}.{hint}")
 
 
@@ -96,13 +99,35 @@ def build(cfg: BuildConfig, kind: str = "plain", sanitize: bool = False) -> Buil
     return BuildResult(bdir, [d for d in diags if d.severity == "warning"], time.monotonic() - start)
 
 
+def _parse_junit(junit: Path, failure_output: dict[str, str] | None) -> dict[str, str]:
+    results: dict[str, str] = {}
+    if not junit.exists():
+        return results
+    for case in ET.parse(junit).getroot().iter("testcase"):
+        name = case.get("name", "?")
+        passed = case.get("status") == "run" and case.find("failure") is None
+        results[name] = "pass" if passed else "fail"
+        if not passed and failure_output is not None:
+            out = case.find("system-out")
+            failure_output[name] = (out.text or "").strip() if out is not None else ""
+    return results
+
+
+FLAKY: set[str] = set()  # tests seen to fail and then pass on an immediate serial rerun, this process
+
+
 def run_tests(
     cfg: BuildConfig, build_dir: Path, sanitize: bool = False, failure_output: dict[str, str] | None = None
 ) -> dict[str, str]:
     """Run ctest and return {test name: "pass" | "fail"}.
 
+    A test that fails is run once more, alone and serially, before it counts as
+    failing. Real suites contain tests that fail now and then (two tests sharing
+    a scratch file when run in parallel, a timing assumption), and a gate that
+    believed every single failure would throw away correct edits.
+
     If `failure_output` is given it is filled with {test name: captured output}
-    for failing tests, so a gate can explain what went wrong.
+    for the tests that really fail, so a gate can explain what went wrong.
     """
     require("ctest")
     junit = build_dir / "refactor-pilot-junit.xml"
@@ -111,21 +136,23 @@ def run_tests(
     if sanitize:
         env.setdefault("ASAN_OPTIONS", "detect_leaks=1:abort_on_error=0")
         env.setdefault("UBSAN_OPTIONS", "print_stacktrace=1")
-    run(
-        ["ctest", "--test-dir", build_dir, "--output-junit", junit,
-         "--timeout", str(cfg.test_timeout), "--parallel", str(cfg.jobs)],
-        env=env,
-    )
-    if not junit.exists():
-        return {}
-    results: dict[str, str] = {}
-    for case in ET.parse(junit).getroot().iter("testcase"):
-        name = case.get("name", "?")
-        passed = case.get("status") == "run" and case.find("failure") is None
-        results[name] = "pass" if passed else "fail"
-        if not passed and failure_output is not None:
-            out = case.find("system-out")
-            failure_output[name] = (out.text or "").strip() if out is not None else ""
+    base = ["ctest", "--test-dir", build_dir, "--timeout", str(cfg.test_timeout)]
+    run([*base, "--output-junit", junit, "--parallel", str(cfg.jobs)], env=env)
+    first_output: dict[str, str] = {}
+    results = _parse_junit(junit, first_output)
+    failed = [name for name, state in results.items() if state == "fail"]
+    if failed:
+        rerun = build_dir / "refactor-pilot-junit-rerun.xml"
+        rerun.unlink(missing_ok=True)
+        run([*base, "--rerun-failed", "--output-junit", rerun], env=env)  # serial on purpose
+        second_output: dict[str, str] = {}
+        again = _parse_junit(rerun, second_output)
+        for name in failed:
+            if again.get(name) == "pass":
+                results[name] = "pass"
+                FLAKY.add(name)
+            elif failure_output is not None:
+                failure_output[name] = second_output.get(name) or first_output.get(name, "")
     return dict(sorted(results.items()))
 
 

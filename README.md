@@ -3,7 +3,7 @@
 An LSP-powered agent that modernizes legacy C++ (C++11/14 → C++20) in small,
 verified, reversible change-sets, and delivers the result as a reviewable branch.
 
-**Status:** All recipes work end to end. On the bundled fixture the
+**Status:** All recipes work end to end, and the deterministic ones have been run on real open-source code. On the bundled fixture the
 full pipeline resolves **32 of 32** planted legacy constructs in 43 verified commits.
 
 | Recipe | What it does | Engine |
@@ -17,6 +17,20 @@ full pipeline resolves **32 of 32** planted legacy constructs in 43 verified com
 | `r6` | Dead code: `#if 0`, stale flags, constant `if`s, unused includes and functions | Text + `clangd` |
 
 Every edit, whoever wrote it, must pass the same gates before it is committed.
+
+## Results so far
+
+Deterministic recipes only (`r1`, `r6`; plus `std` on the fixture), `g++` 13, ASan + UBSan on:
+
+| Target | Commits | Rejected by a gate | clang-tidy modernize findings | Diff |
+|---|---|---|---|---|
+| Bundled fixture | 27 | 0 | 67 → 32 | 11 files, +67 −92 |
+| tinyxml2 6.2.0 | 15 | 0 | 454 → 102 | 3 files, +423 −626 |
+| jsoncpp 1.9.3 | 21 | 1 | 93 → 80 | 15 files, +109 −110 |
+
+The open-source rows are a dry run of *proposed* benchmark targets, measured in the
+author's sandbox. Reproduce them with `refactor-pilot bench bench/targets.json --include-proposed`.
+The model-written recipes (`r2`–`r5`) have so far only been run with scripted answers.
 
 ## Why it is built this way
 
@@ -122,6 +136,11 @@ must be unchanged (unless `--allow-api-changes`), and the full gate including
 sanitizers must pass. A rejected attempt is rolled back and its reason is sent
 back to the model for the next attempt.
 
+```bash
+# Benchmark: run pipelines over the repositories listed in a config and write a report
+refactor-pilot bench bench/targets.json
+```
+
 Target repos must be CMake projects, and `apply` and `run` need them to be in a git repository. Build trees go to the system temp directory unless `--work-dir` is given.
 
 ## The fixture
@@ -178,6 +197,9 @@ src/refactor_pilot/
   diagnostics.py   parse compiler / clang-tidy output
   build.py         configure, build, ctest, clang-tidy (out-of-tree)
   baseline.py      snapshots and the regression comparison
+  textio.py        file I/O that preserves line endings and non-UTF-8 bytes
+  pipeline.py      run a list of recipes on one branch and measure the result
+  bench.py         benchmark over several pinned repositories, Markdown + JSON report
   checkpoint.py    private git worktree: commit, rollback, cherry-pick
   gates.py         fast gate and full gate, with feedback text for retries
   session.py       executor loop: apply -> verify -> commit or roll back; culprit search
@@ -191,7 +213,8 @@ src/refactor_pilot/
   evalkit/         manifests and scoring
   cli.py           baseline | check | score | symbols | refs | apply | run
 examples/patches/            three good and three bad patches for the fixture
-examples/replays/            recorded model answers for R2 on the fixture
+examples/replays/            recorded model answers for R2-R5 on the fixture
+bench/targets.json           benchmark targets (approved and proposed)
 fixtures/legacy_inventory/   benchmark target
 tests/                       unit tests + end-to-end tests with injected bugs
 ```

@@ -81,6 +81,10 @@ class Verifier:
             snap.sanitizer_tests = buildmod.run_tests(self.cfg, self._san.build_dir, sanitize=True)
         return snap
 
+    def warning_count(self) -> int:
+        """How many compiler warnings the tree has right now (an incremental build, no tests)."""
+        return len(self._plain.build().warnings)
+
     def set_baseline(self, snap: Snapshot | None = None) -> Snapshot:
         self.baseline = snap or self.snapshot()
         return self.baseline

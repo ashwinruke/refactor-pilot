@@ -119,3 +119,13 @@ def test_edit_on_disk_is_picked_up_after_invalidate(nav):
         path.write_text(original)
         nav.invalidate("src/util.cpp")
     assert [d for d in nav.diagnostics("src/util.cpp") if d.severity == "error"] == []
+
+
+def test_clangd_crash_is_survived(nav):
+    """Kill clangd mid-session; the next query restarts it and still answers."""
+    before = nav.restarts
+    nav._client.kill()
+    outline = {s.name for s in nav.outline("include/inventory/warehouse.h")}
+    assert "inventory::Warehouse::release" in outline
+    assert nav.restarts == before + 1
+    assert nav.diagnostics("src/util.cpp") is not None

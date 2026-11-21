@@ -6,3 +6,4 @@ build/
 dist/
 *.baseline.json
 .refactor-pilot/
+bench-results/

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "refactor-pilot"
-version = "0.6.0"
+version = "0.7.0"
 description = "LSP-powered agent that modernizes legacy C++ (C++11/14 -> C++20) with verified, reversible change-sets"
 readme = "README.md"
 requires-python = ">=3.10"

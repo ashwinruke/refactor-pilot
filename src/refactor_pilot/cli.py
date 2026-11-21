@@ -8,6 +8,7 @@ Commands:
   refs      show a symbol's signature, callers and every reference (via clangd)
   apply     push patches through the verification gates onto a new branch
   run       run recipes on a new branch: std, r1..r6, or all
+  bench     run recipe pipelines over a list of repositories and write a report
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import __version__, baseline
+from . import __version__, baseline, bench, pipeline
 from . import build as buildmod
 from .build import BuildConfig, BuildFailed
 from .checkpoint import CheckpointError
@@ -24,13 +25,14 @@ from .evalkit import score as scoremod
 from .lsp import LspError
 from .navigator import SymbolNavigator
 from .llm import Budget, LlmError, RecordingClient, ReplayClient, client_from_env
-from .recipes import llm_engine, r1_mechanical, r6_dead_code, std_raise
+from .recipes import llm_engine
 from .session import ChangeSet, Session
 from .toolchain import ToolMissing
 
 
 def _config(args: argparse.Namespace) -> BuildConfig:
-    return BuildConfig(repo=args.repo, work_dir=args.work_dir, compiler=args.compiler)
+    return BuildConfig(repo=args.repo, work_dir=args.work_dir, compiler=args.compiler,
+                       cmake_args=list(getattr(args, "cmake_arg", []) or []))
 
 
 def _capture(args: argparse.Namespace) -> baseline.Snapshot:
@@ -87,14 +89,14 @@ def cmd_score(args: argparse.Namespace) -> int:
 
 
 def cmd_symbols(args: argparse.Namespace) -> int:
-    with SymbolNavigator(BuildConfig(repo=args.repo, work_dir=args.work_dir, compiler=args.compiler)) as nav:
+    with SymbolNavigator(_config(args)) as nav:
         for sym in nav.outline(args.file):
             print(f"{sym.location.line:5d}  {sym.kind:<12} {sym.name}")
     return 0
 
 
 def cmd_refs(args: argparse.Namespace) -> int:
-    with SymbolNavigator(BuildConfig(repo=args.repo, work_dir=args.work_dir, compiler=args.compiler)) as nav:
+    with SymbolNavigator(_config(args)) as nav:
         matches = nav.find(args.symbol)
         if not matches:
             print(f"no symbol named '{args.symbol}' in {nav.repo}", file=sys.stderr)
@@ -183,19 +185,6 @@ def _llm_client(args: argparse.Namespace):
     return RecordingClient(client, args.record) if args.record else client
 
 
-RECIPES = {
-    "std": "raise the C++ standard (default C++20)",
-    "r1": "mechanical fixes from clang-tidy",
-    "r2": "ownership and RAII (LLM)",
-    "r3": "macros to constexpr, enum class (LLM)",
-    "r4": "SFINAE to concepts (LLM; clang-tidy in r1 does most of it at C++20)",
-    "r5": "C++20 library: std::format, std::span, starts_with (LLM)",
-    "r6": "dead-code pruning",
-}
-ALL = ["std", "r1", "r6", "r2", "r3", "r4", "r5"]
-LLM_RECIPES = ("r2", "r3", "r4", "r5")
-
-
 def _parse_flags(items: list[str]) -> dict[str, bool]:
     flags = {}
     for item in items or []:
@@ -207,87 +196,84 @@ def _parse_flags(items: list[str]) -> dict[str, bool]:
 
 
 def _parse_recipes(text: str) -> list[str] | None:
-    recipes: list[str] = []
-    for name in (r.strip().lower() for r in text.split(",") if r.strip()):
-        if name == "all":
-            recipes += ALL
-        elif name in RECIPES:
-            recipes.append(name)
-        else:
-            print(f"error: unknown recipe '{name}'. Choose from: {', '.join(RECIPES)}, all", file=sys.stderr)
-            return None
-    if not recipes:
-        print(f"error: no recipe given. Choose from: {', '.join(RECIPES)}, all", file=sys.stderr)
+    try:
+        return pipeline.parse_recipes(text)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return None
-    return recipes
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     recipes = _parse_recipes(args.recipe)
     if recipes is None:
         return 2
-    checks = [c.strip() for c in args.checks.split(",") if c.strip()] if args.checks else None
-    flags = _parse_flags(args.flag)
-    model_recipes = [r for r in recipes if r in LLM_RECIPES]
-    client = _llm_client(args) if model_recipes and not args.plan else None
+    model_recipes = [r for r in recipes if r in pipeline.LLM_RECIPES]
     log = lambda message: print(f"  {message}", flush=True)  # noqa: E731
-    session = Session(
-        args.repo, work_dir=args.work_dir, compiler=args.compiler, branch=args.branch,
-        sanitizers=not args.no_sanitizers, full_every=args.full_every,
-        allow_dirty=args.allow_dirty, keep_worktree=args.keep_worktree, log=log,
-    )
-    notes: list[str] = []
-    with session:
-        print(f"branch {session.workspace.branch} (private worktree: {session.workspace.worktree})")
-        score_before = scoremod.score(session.workspace.repo, args.manifest) if args.manifest else None
-        if args.plan:
-            kinds = tuple(k for r in (model_recipes or LLM_RECIPES) for k in llm_engine.RECIPE_KINDS[r])
+    if args.plan:
+        session = Session(args.repo, work_dir=args.work_dir, compiler=args.compiler, branch=args.branch,
+                          sanitizers=False, allow_dirty=args.allow_dirty, log=log, cmake_args=args.cmake_arg)
+        with session:
+            kinds = tuple(k for r in (model_recipes or pipeline.LLM_RECIPES) for k in llm_engine.RECIPE_KINDS[r])
             return _print_plan(session, args.allow_api_changes, kinds)
-        findings_before = len(buildmod.run_tidy(session.cfg, session.build_dir)) if "r1" in recipes else 0
-        if client is not None:
-            if isinstance(client, ReplayClient):
-                print(f"  model: replaying {args.replay} (no network, no key)")
-            else:
-                inner = client.inner if isinstance(client, RecordingClient) else client
-                print(f"  model: {inner.model} via {inner.base_url}; budget {inner.budget.max_requests} requests")
-        stopped = ""
-        for recipe in recipes:
-            print(f"  -- recipe {recipe}: {RECIPES[recipe]}")
-            if recipe == "std":
-                std_raise.run(session, args.std, log=log)
-            elif recipe == "r1":
-                r1_mechanical.run(session, checks)
-            elif recipe == "r6":
-                dead = r6_dead_code.run(session, flags, allow_api_changes=args.allow_api_changes, log=log)
-                for name in dead.flag_candidates:
-                    notes.append(f"flag never defined in this build: {name}  (to remove its branches: --flag {name}=off)")
-            elif stopped:
-                print(f"  skipped: the model is unavailable ({stopped})")
-            else:
-                stopped = llm_engine.run(
-                    session, client, allow_api_changes=args.allow_api_changes, max_attempts=args.max_attempts,
-                    kinds=llm_engine.RECIPE_KINDS[recipe], log=log,
-                ).stopped
-        if stopped:
-            notes.append(f"stopped early: {stopped}")
-        session.checkpoint()  # settle everything before measuring
-        findings_after = len(buildmod.run_tidy(session.cfg, session.build_dir)) if "r1" in recipes else 0
-        score_after = scoremod.score(session.workspace.repo, args.manifest) if args.manifest else None
-    _print_report(session.report, show_unchanged=args.verbose or recipes != ["r1"])
+    client = _llm_client(args) if model_recipes else None
+    opts = pipeline.PipelineOptions(
+        repo=args.repo, recipes=recipes, branch=args.branch, work_dir=args.work_dir, compiler=args.compiler,
+        sanitizers=not args.no_sanitizers, full_every=args.full_every, allow_dirty=args.allow_dirty,
+        keep_worktree=args.keep_worktree,
+        checks=[c.strip() for c in args.checks.split(",") if c.strip()] if args.checks else None,
+        flags=_parse_flags(args.flag), allow_api_changes=args.allow_api_changes, std=args.std,
+        max_attempts=args.max_attempts, manifest=args.manifest, cmake_args=args.cmake_arg,
+        measure_tidy="r1" in recipes,
+    )
+
+    def on_start(session: Session) -> None:
+        print(f"branch {session.workspace.branch} (private worktree: {session.workspace.worktree})")
+        if isinstance(client, ReplayClient):
+            print(f"  model: replaying {args.replay} (no network, no key)")
+        elif client is not None:
+            inner = client.inner if isinstance(client, RecordingClient) else client
+            print(f"  model: {inner.model} via {inner.base_url}; budget {inner.budget.max_requests} requests")
+
+    result = pipeline.run_pipeline(opts, client, log=log, on_start=on_start)
+    _print_report(result.report, show_unchanged=args.verbose or recipes != ["r1"])
     print()
     if "r1" in recipes:
-        print(f"clang-tidy modernize findings: {findings_before} -> {findings_after}")
+        print(f"clang-tidy modernize findings: {sum(result.tidy_before.values())} -> {sum(result.tidy_after.values())}")
     if client is not None:
-        print(f"model usage: {client.budget.requests} requests, {client.budget.tokens} tokens")
-    for note in notes:
+        print(f"model usage: {result.requests} requests, {result.tokens} tokens")
+    if result.stopped:
+        print(f"stopped early: {result.stopped}")
+    for note in result.notes:
         print(note)
-    if score_after is not None:
-        print(f"manifest score: {len(score_before.resolved)}/{score_before.total} -> "
-              f"{len(score_after.resolved)}/{score_after.total} legacy constructs resolved")
-        for recipe, (done, total) in score_after.by_recipe.items():
-            was = score_before.by_recipe[recipe][0]
-            print(f"  {recipe}: {was}/{total} -> {done}/{total}")
+    if result.score_after is not None:
+        before, after = result.score_before, result.score_after
+        print(f"manifest score: {len(before.resolved)}/{before.total} -> "
+              f"{len(after.resolved)}/{after.total} legacy constructs resolved")
+        for recipe, (done, total) in after.by_recipe.items():
+            print(f"  {recipe}: {before.by_recipe[recipe][0]}/{total} -> {done}/{total}")
     return 0
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    only = [n.strip() for n in args.only.split(",") if n.strip()] if args.only else None
+    client, model = None, "none"
+    try:
+        _, targets = bench.load_config(args.config)
+        selected = [t for t in targets if (t.name in only if only else (args.include_proposed or t.status == "approved"))]
+        if any(r in pipeline.LLM_RECIPES for t in selected for r in pipeline.parse_recipes(t.recipes)):
+            client = _llm_client(args)
+            inner = client.inner if isinstance(client, RecordingClient) else client
+            model = f"replay of {args.replay.name}" if isinstance(client, ReplayClient) else inner.model
+        results = bench.run_bench(args.config, args.out, compiler=args.compiler, only=only,
+                                  include_proposed=args.include_proposed, client=client, model_name=model,
+                                  keep_branches=args.keep_branches)
+    except (bench.BenchError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print()
+    print((args.out / "REPORT.md").read_text())
+    print(f"written: {args.out / 'REPORT.md'} and {args.out / 'results.json'}")
+    return 0 if all(r.status == "ok" for r in results) else 1
 
 
 def _print_plan(session: Session, allow_api_changes: bool, kinds: tuple[str, ...]) -> int:
@@ -328,6 +314,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--compiler", default="clang++")
         p.add_argument("--no-sanitizers", action="store_true", help="skip the ASan+UBSan build and test run")
         p.add_argument("--no-tidy", action="store_true", help="skip clang-tidy")
+        p.add_argument("--cmake-arg", action="append", default=[], metavar="ARG",
+                       help="extra argument for cmake configure, e.g. --cmake-arg=-DBUILD_TESTS=ON (repeatable)")
 
     p = sub.add_parser("baseline", help="record the repo's current warnings and test results")
     add_build_args(p)
@@ -343,6 +331,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("repo", type=Path, help="path to a CMake project")
         p.add_argument("--work-dir", type=Path, default=None)
         p.add_argument("--compiler", default="clang++")
+        p.add_argument("--cmake-arg", action="append", default=[], metavar="ARG")
 
     p = sub.add_parser("symbols", help="list the symbols declared in a file")
     add_lsp_args(p)
@@ -371,6 +360,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--recipe", default="r1",
                    help="std, r1, r2, r3, r4, r5, r6 or all; comma-separated to run several in order on one "
                         "branch, e.g. std,r1,r6. 'all' is std,r1,r6,r2,r3,r4,r5")
+    p.add_argument("--cmake-arg", action="append", default=[], metavar="ARG",
+                   help="extra argument for cmake configure, e.g. --cmake-arg=-DBUILD_TESTS=ON (repeatable)")
     p.add_argument("--std", type=int, default=20, choices=[14, 17, 20, 23],
                    help="std: the C++ standard to raise the project to (default 20)")
     p.add_argument("--flag", action="append", default=[], metavar="NAME=on|off",
@@ -394,6 +385,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-worktree", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true", help="also list findings that have no automatic fix")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("bench", help="benchmark recipe pipelines over several repositories")
+    p.add_argument("config", type=Path, help="JSON file listing the targets (see bench/targets.json)")
+    p.add_argument("--out", type=Path, default=Path("bench-results"), help="where REPORT.md and results.json go")
+    p.add_argument("--only", default=None, help="comma-separated target names to run, whatever their status")
+    p.add_argument("--include-proposed", action="store_true", help="also run targets whose status is 'proposed'")
+    p.add_argument("--keep-branches", action="store_true",
+                   help="keep each target's result branch (refactor-pilot/bench-<time>) for inspection")
+    p.add_argument("--compiler", default="clang++")
+    p.add_argument("--replay", type=Path, default=None)
+    p.add_argument("--record", type=Path, default=None)
+    p.add_argument("--max-requests", type=int, default=200)
+    p.set_defaults(func=cmd_bench)
 
     p = sub.add_parser("score", help="count resolved legacy constructs from a manifest")
     p.add_argument("repo", type=Path)

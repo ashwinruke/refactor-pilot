@@ -58,9 +58,11 @@ class SymbolNavigator:
         self.cfg = cfg
         self.repo = cfg.repo
         self._build_dir = buildmod.configure(cfg, "plain")
+        self._clangd = clangd
         self._client = ClangdClient(self.repo, self._build_dir, clangd=clangd, jobs=cfg.jobs)
         self._index_timeout = index_timeout
         self._lines: dict[Path, list[str]] = {}
+        self.restarts = 0  # times clangd crashed and was restarted
 
     def start(self) -> "SymbolNavigator":
         self._client.start()
@@ -73,6 +75,25 @@ class SymbolNavigator:
 
     def stop(self) -> None:
         self._client.stop()
+
+    MAX_RESTARTS = 5
+
+    def _ask(self, method: str, *args):
+        """Call a clangd query; if clangd has crashed, restart it and ask once more.
+
+        clangd does crash on some real code. One crash should cost one answer at
+        most, not the rest of the run.
+        """
+        try:
+            return getattr(self._client, method)(*args)
+        except LspError:
+            if self._client.alive() or self.restarts >= self.MAX_RESTARTS:
+                raise
+        self.restarts += 1
+        self._client.stop()
+        self._client = ClangdClient(self.repo, self._build_dir, clangd=self._clangd, jobs=self.cfg.jobs)
+        self._client.start()
+        return getattr(self._client, method)(*args)
 
     def __enter__(self) -> "SymbolNavigator":
         return self.start()
@@ -105,7 +126,7 @@ class SymbolNavigator:
         """Forget cached text for a file and tell clangd it changed on disk."""
         path = self._abs(file)
         self._lines.pop(path, None)
-        self._client.refresh(path)
+        self._ask("refresh", path)
 
     def _to_lsp(self, loc: Location) -> tuple[Path, int, int]:
         path = self._abs(loc.file)
@@ -154,7 +175,7 @@ class SymbolNavigator:
                     out.append(Symbol(full, SYMBOL_KINDS.get(node["kind"], "?"), self._from_lsp(uri, rng["start"]),
                                       rng["end"]["line"] + 1, rng["start"]["line"] + 1))
 
-        walk(self._client.document_symbols(path), "")
+        walk(self._ask("document_symbols", path), "")
         return out
 
     def find(self, name: str, kind: str | None = None) -> list[Symbol]:
@@ -165,7 +186,7 @@ class SymbolNavigator:
         wanted = name.lstrip(":")
         short = wanted.rsplit("::", 1)[-1]
         found: dict[tuple, Symbol] = {}
-        for raw in self._client.workspace_symbols(short):
+        for raw in self._ask("workspace_symbols", short):
             if raw["name"] != short:
                 continue
             container = raw.get("containerName", "").rstrip(":")
@@ -182,20 +203,20 @@ class SymbolNavigator:
         return sorted(found.values(), key=lambda s: (s.name, s.location.file, s.location.line))
 
     def definition(self, loc: Location) -> list[Location]:
-        return self._locations(self._client.definition(*self._to_lsp(loc)))
+        return self._locations(self._ask("definition", *self._to_lsp(loc)))
 
     def references(self, loc: Location, include_declaration: bool = True) -> list[Location]:
         """The declaration, definition and every use of the symbol at `loc`."""
-        return self._locations(self._client.references(*self._to_lsp(loc), include_declaration))
+        return self._locations(self._ask("references", *self._to_lsp(loc), include_declaration))
 
     def signature(self, loc: Location) -> str:
         """Type information for the symbol at `loc` (clangd's hover text)."""
-        return self._client.hover(*self._to_lsp(loc)).strip()
+        return self._ask("hover", *self._to_lsp(loc)).strip()
 
     def callers(self, loc: Location) -> list[Symbol]:
         """Functions that call the function at `loc`."""
         out = []
-        for call in self._client.incoming_calls(*self._to_lsp(loc)):
+        for call in self._ask("incoming_calls", *self._to_lsp(loc)):
             item = call["from"]
             where = self._from_lsp(item["uri"], item["selectionRange"]["start"])
             out.append(Symbol(item["name"], SYMBOL_KINDS.get(item["kind"], "?"), where))
@@ -207,7 +228,7 @@ class SymbolNavigator:
         uri = path.resolve().as_uri()
         severities = {1: "error", 2: "warning", 3: "info", 4: "hint"}
         out = []
-        for raw in self._client.diagnostics(path):
+        for raw in self._ask("diagnostics", path):
             out.append(
                 Diagnostic(
                     self._from_lsp(uri, raw["range"]["start"]),

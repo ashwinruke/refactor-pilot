@@ -96,8 +96,11 @@ class Session:
         allow_dirty: bool = False,
         keep_worktree: bool = False,
         log: Callable[[str], None] = lambda message: None,
+        cmake_args: list[str] | None = None,
+        test_timeout: int = 120,
     ):
-        self._source_cfg = BuildConfig(repo=repo, work_dir=work_dir, compiler=compiler)
+        self._source_cfg = BuildConfig(repo=repo, work_dir=work_dir, compiler=compiler,
+                                       cmake_args=list(cmake_args or []), test_timeout=test_timeout)
         self._branch, self._sanitizers = branch, sanitizers
         self.full_every, self.max_attempts = max(1, full_every), max(1, max_attempts)
         self._allow_dirty, self._keep_worktree, self._log = allow_dirty, keep_worktree, log
@@ -132,6 +135,8 @@ class Session:
                 repo=self.workspace.repo,
                 work_dir=work / ("build-" + self.workspace.branch.replace("/", "-")),
                 compiler=self._source_cfg.compiler,
+                cmake_args=list(self._source_cfg.cmake_args),
+                test_timeout=self._source_cfg.test_timeout,
             )
             self.verifier = Verifier(cfg, sanitizers=self._sanitizers)
             self._log("recording baseline (full build, first time only)")

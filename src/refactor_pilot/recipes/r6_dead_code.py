@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Callable
 
 from .. import build as buildmod
-from .. import preproc
+from .. import preproc, textio
+from ..lsp import LspError
 from ..navigator import SymbolNavigator
 from ..session import ChangeSet, Outcome, Session
 from .r2_ownership import HEADER_SUFFIXES, is_test_file
@@ -65,8 +66,10 @@ def undefined_flag_candidates(cfg, build_dir: Path, files: list[str]) -> list[st
     guards: set[str] = set()
     for rel in files:
         text = preproc.mask((repo / rel).read_text(errors="replace"))
-        for m in _CONDITION_MACROS.finditer(text):
-            tested |= set(re.findall(r"\b[A-Za-z_]\w*\b", m.group(1)))
+        for group in preproc.conditionals(text.split("\n")):
+            flag = preproc.flag_of(group)  # only the plain forms --flag can resolve
+            if flag is not None and not group.has_elif:
+                tested.add(flag[0])
         defined |= set(re.findall(r"^\s*#\s*define\s+(\w+)", text, re.MULTILINE))
         guard = re.search(r"^\s*#\s*ifndef\s+(\w+)\s*\n\s*#\s*define\s+\1\b", text, re.MULTILINE)
         if guard:
@@ -101,9 +104,14 @@ def run(
 
     def rewrite(rel: str, transform: Callable[[str], str]) -> Callable[[Path, str | None], None]:
         def apply(repo_dir: Path, feedback: str | None) -> None:
-            path = repo_dir / rel
-            path.write_text(transform(path.read_text(errors="replace")))
+            textio.rewrite(repo_dir / rel, transform)
         return apply
+
+    def diagnostics_of(rel: str) -> list:
+        try:
+            return nav.diagnostics(rel)
+        except LspError:  # clangd has nothing to say about this file (often a header it cannot parse alone)
+            return []
 
     with SymbolNavigator(cfg) as nav:
         def submit(change: ChangeSet) -> Outcome:
@@ -172,7 +180,7 @@ def run(
 
         # ---- unused #includes (clangd include analysis)
         for rel in files:
-            unused = sorted({d.location.line for d in nav.diagnostics(rel) if d.code == "unused-includes"}, reverse=True)
+            unused = sorted({d.location.line for d in diagnostics_of(rel) if d.code == "unused-includes"}, reverse=True)
             if unused:
                 def drop(text: str, unused=unused) -> str:
                     lines = text.split("\n")
@@ -214,9 +222,8 @@ def run(
                     nav.invalidate(rel)
                     for sym in sorted(nav.outline(rel), key=lambda s: -s.location.line):
                         if sym.kind == "function" and sym.name.rsplit("::", 1)[-1] == short and sym.name.endswith(name.split("::", 1)[-1]):
-                            path = repo_dir / rel
-                            path.write_text(preproc.remove_lines(path.read_text(errors="replace"),
-                                                                 sym.start_line or sym.location.line, sym.end_line))
+                            textio.rewrite(repo_dir / rel, lambda text, sym=sym: preproc.remove_lines(
+                                text, sym.start_line or sym.location.line, sym.end_line))
 
             submit(ChangeSet(f"r6/unreferenced-public/{name}",
                              f"tier 2: remove unreferenced public function {name} ({', '.join(touched)})",
@@ -227,7 +234,11 @@ def run(
 
 
 def _next_unused_internal(nav: SymbolNavigator, rel: str, tried: set[str]) -> tuple[str, int, int] | None:
-    flagged = [d for d in nav.diagnostics(rel) if d.code in ("-Wunused-function", "-Wunused-const-variable")]
+    try:
+        found = nav.diagnostics(rel)
+    except LspError:
+        return None
+    flagged = [d for d in found if d.code in ("-Wunused-function", "-Wunused-const-variable")]
     if not flagged:
         return None
     outline = nav.outline(rel)
@@ -261,4 +272,5 @@ def _unreferenced_public_functions(nav: SymbolNavigator, repo: Path, files: list
             references = {(r.file, r.line) for r in nav.references(sym.location)}
             if references and references <= sites.get(sym.name, set()):
                 dead.append((sym.name, sites[sym.name]))
-    return sorted(dead, key=lambda item: item[0])
+    unique = {name: where for name, where in dead}  # overloads share a name; report it once
+    return sorted(unique.items())

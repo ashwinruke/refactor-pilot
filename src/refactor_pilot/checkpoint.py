@@ -100,6 +100,18 @@ class Workspace:
         out = _git(self.worktree, "log", "--reverse", "--format=%H%x09%s", f"{self.base_sha}..HEAD").output
         return [tuple(line.split("\t", 1)) for line in out.splitlines() if line]
 
+    def diffstat(self) -> tuple[int, int, int]:
+        """(files changed, lines added, lines removed) in the target since the session began."""
+        out = _git(self.worktree, "diff", "--numstat", self.base_sha, "HEAD", "--", str(self.prefix)).output
+        files = added = removed = 0
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3:
+                files += 1
+                added += int(parts[0]) if parts[0].isdigit() else 0
+                removed += int(parts[1]) if parts[1].isdigit() else 0
+        return files, added, removed
+
     # ---- checkpoints -----------------------------------------------------
 
     def commit(self, message: str) -> str | None:
