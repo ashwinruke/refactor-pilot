@@ -79,7 +79,7 @@ class ClangdClient:
                     "general": {"positionEncodings": ["utf-16"]},
                     "window": {"workDoneProgress": True},
                     "textDocument": {
-                        "publishDiagnostics": {"relatedInformation": False},
+                        "publishDiagnostics": {"relatedInformation": False, "versionSupport": True},
                         "hover": {"contentFormat": ["plaintext"]},
                         "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
                         "callHierarchy": {"dynamicRegistration": False},
@@ -142,9 +142,14 @@ class ClangdClient:
                     self._index_active = False
                 self._cond.notify_all()
         elif method == "textDocument/publishDiagnostics":
+            uri, version = params["uri"], params.get("version")
             with self._cond:
-                self._diagnostics[params["uri"]] = params.get("diagnostics", [])
-                self._cond.notify_all()
+                # clangd can deliver the diagnostics of an older version of a file
+                # after we have sent a newer one. Their line numbers describe text
+                # that no longer exists, so only the current version is accepted.
+                if version is None or version == self._versions.get(uri):
+                    self._diagnostics[uri] = params.get("diagnostics", [])
+                    self._cond.notify_all()
 
     # ---- documents -------------------------------------------------------
 

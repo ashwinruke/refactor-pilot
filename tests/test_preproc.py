@@ -91,3 +91,12 @@ def test_fold_handles_nested_braces_and_braces_in_strings():
 def test_remove_lines_takes_the_comment_above():
     source = "int a;\n\n// about f\n// more\nstatic void f() {\n}\n\nint b;\n"
     assert preproc.remove_lines(source, 5, 6) == "int a;\n\nint b;\n"
+
+
+def test_dead_code_diagnostic_must_name_the_symbol_it_is_matched_to():
+    from refactor_pilot.recipes.r6_dead_code import _names
+
+    assert _names("Unused function 'legacy_round_cents'", "inventory::legacy_round_cents")
+    assert _names("unused function 'ns::helper'", "ns::helper")
+    assert not _names("Unused function 'legacy_round_cents'", "inventory::bulk_price")
+    assert not _names("unused function 'helper2'", "ns::helper")

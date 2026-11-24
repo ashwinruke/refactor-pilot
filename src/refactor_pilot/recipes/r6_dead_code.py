@@ -245,9 +245,21 @@ def _next_unused_internal(nav: SymbolNavigator, rel: str, tried: set[str]) -> tu
     for diag in flagged:
         for sym in outline:
             if sym.location.line == diag.location.line and sym.kind in ("function", "variable", "constant") \
-                    and sym.name not in tried:
+                    and sym.name not in tried and _names(diag.message, sym.name):
                 return sym.name, sym.start_line or sym.location.line, max(sym.end_line, sym.location.line)
     return None
+
+
+def _names(message: str, qualified: str) -> bool:
+    """Does this diagnostic really talk about this symbol?
+
+    Matching a diagnostic to a symbol by line number alone is not enough: if the
+    two were computed from different versions of the file, the line can belong to
+    something else entirely. The compiler names what it complains about
+    ("unused function 'helper'"), so the name has to agree as well.
+    """
+    short = qualified.rsplit("::", 1)[-1]
+    return re.search(r"(?<![\w:])(?:[\w:]*::)?" + re.escape(short) + r"(?!\w)", message) is not None
 
 
 def _unreferenced_public_functions(nav: SymbolNavigator, repo: Path, files: list[str]) -> list[tuple[str, set]]:

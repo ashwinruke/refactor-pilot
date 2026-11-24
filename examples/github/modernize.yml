@@ -1,0 +1,72 @@
+# Example workflow for a C++ project that wants refactor-pilot to propose
+# modernization pull requests. Copy it to .github/workflows/modernize.yml in
+# THAT project (not in refactor-pilot) and adjust the three marked lines.
+#
+# It runs the deterministic recipes (r1: clang-tidy fixes, r6: dead code), which
+# need no API key. Every commit on the resulting branch has built and passed the
+# project's tests, including under ASan + UBSan.
+name: modernize
+
+on:
+  workflow_dispatch:        # run by hand from the Actions tab
+  schedule:
+    - cron: "0 3 * * 1"     # and every Monday at 03:00 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  modernize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install the C++ toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ clang clang-tidy clangd libclang-rt-dev
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install refactor-pilot
+        # ADJUST: point this at where refactor-pilot lives.
+        run: pip install "git+https://github.com/ashwinruke/refactor-pilot.git"
+
+      - name: Run the recipes on a new branch
+        id: run
+        run: |
+          BRANCH="refactor-pilot/auto-$(date +%Y%m%d)"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          # ADJUST: the recipes, and any --cmake-arg your project needs to build its tests.
+          refactor-pilot run . --recipe r1,r6 --branch "$BRANCH" | tee refactor-pilot.log
+          if git rev-parse --verify --quiet "$BRANCH" >/dev/null; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open a pull request
+        if: steps.run.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git push origin "${{ steps.run.outputs.branch }}"
+          {
+            echo "Automated modernization by refactor-pilot."
+            echo
+            echo "Every commit on this branch built, added no compiler warning, and kept all tests passing."
+            echo "Review it commit by commit: each one is a single kind of change in a single file."
+            echo
+            echo '```'
+            sed -n '/ committed, /,$p' refactor-pilot.log | head -40
+            echo '```'
+          } > pr-body.md
+          # ADJUST: the base branch.
+          gh pr create --base main --head "${{ steps.run.outputs.branch }}" \
+            --title "Modernize: mechanical fixes and dead code" --body-file pr-body.md

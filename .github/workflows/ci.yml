@@ -1,0 +1,40 @@
+# Runs refactor-pilot's own test suite on every push and pull request.
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the C++ toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ clang clang-tidy clangd
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install refactor-pilot
+        run: pip install -e ".[dev]"
+
+      - name: Show tool versions
+        run: |
+          cmake --version | head -1
+          ninja --version
+          g++ --version | head -1
+          clang-tidy --version | head -2
+          clangd --version | head -1
+
+      - name: Tests (the whole-pipeline test is skipped to keep CI short)
+        run: pytest -m "not slow"

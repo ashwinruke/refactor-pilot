@@ -9,6 +9,7 @@ Commands:
   apply     push patches through the verification gates onto a new branch
   run       run recipes on a new branch: std, r1..r6, or all
   bench     run recipe pipelines over a list of repositories and write a report
+  mcp       serve the navigation and verified-change tools to an MCP client over stdio
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import __version__, baseline, bench, pipeline
+from . import __version__, baseline, bench, mcp_server, pipeline
 from . import build as buildmod
 from .build import BuildConfig, BuildFailed
 from .checkpoint import CheckpointError
@@ -254,6 +255,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    repo = args.repo.resolve()
+    if not repo.is_dir():
+        print(f"error: {repo} is not a directory", file=sys.stderr)
+        return 2
+    mcp_server.Server(repo, compiler=args.compiler, cmake_args=args.cmake_arg, work_dir=args.work_dir,
+                      sanitizers=not args.no_sanitizers).serve()
+    return 0
+
+
 def cmd_bench(args: argparse.Namespace) -> int:
     only = [n.strip() for n in args.only.split(",") if n.strip()] if args.only else None
     client, model = None, "none"
@@ -385,6 +396,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-worktree", action="store_true")
     p.add_argument("-v", "--verbose", action="store_true", help="also list findings that have no automatic fix")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("mcp", help="run as an MCP server (stdio) for one repository")
+    p.add_argument("repo", type=Path, help="path to a CMake project inside a git repository")
+    p.add_argument("--work-dir", type=Path, default=None)
+    p.add_argument("--compiler", default="clang++")
+    p.add_argument("--no-sanitizers", action="store_true")
+    p.add_argument("--cmake-arg", action="append", default=[], metavar="ARG")
+    p.set_defaults(func=cmd_mcp)
 
     p = sub.add_parser("bench", help="benchmark recipe pipelines over several repositories")
     p.add_argument("config", type=Path, help="JSON file listing the targets (see bench/targets.json)")

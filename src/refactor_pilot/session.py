@@ -67,6 +67,7 @@ class Outcome:
     reason: str = ""
     files: list[str] = field(default_factory=list)
     seconds: float = 0.0
+    feedback: str = ""  # the full text of the last rejection: compiler errors, failing test output
 
 
 @dataclass
@@ -227,6 +228,7 @@ class Session:
             outcome.reason, feedback = gate.summary(), gate.feedback()
             self._attempt_failed(change, attempt, attempts, outcome.reason)
         outcome.seconds = time.monotonic() - start
+        outcome.feedback = "" if outcome.status == "committed" else (feedback or "")
         self._log(f"{outcome.status:<11} {change.id}" + (f"  ({outcome.reason})" if outcome.reason else ""))
         if len(self._pending) >= self.full_every:
             self.checkpoint()

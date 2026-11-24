@@ -3,8 +3,9 @@
 An LSP-powered agent that modernizes legacy C++ (C++11/14 → C++20) in small,
 verified, reversible change-sets, and delivers the result as a reviewable branch.
 
-**Status:** All recipes work end to end, and the deterministic ones have been run on real open-source code. On the bundled fixture the
-full pipeline resolves **32 of 32** planted legacy constructs in 43 verified commits.
+**Status:** Seven recipes, a benchmark, and an MCP server.
+On the bundled fixture the full pipeline resolves **32 of 32** planted legacy constructs in 43 verified commits.
+Read [What has been verified](#what-has-been-verified) before relying on any of it.
 
 | Recipe | What it does | Engine |
 |---|---|---|
@@ -28,9 +29,19 @@ Deterministic recipes only (`r1`, `r6`; plus `std` on the fixture), `g++` 13, AS
 | tinyxml2 6.2.0 | 15 | 0 | 454 → 102 | 3 files, +423 −626 |
 | jsoncpp 1.9.3 | 21 | 1 | 93 → 80 | 15 files, +109 −110 |
 
-The open-source rows are a dry run of *proposed* benchmark targets, measured in the
-author's sandbox. Reproduce them with `refactor-pilot bench bench/targets.json --include-proposed`.
-The model-written recipes (`r2`–`r5`) have so far only been run with scripted answers.
+The open-source rows are a dry run of *proposed* benchmark targets, measured during
+development. Reproduce them with `refactor-pilot bench bench/targets.json --only tinyxml2,jsoncpp`.
+
+## What has been verified
+
+| Part | Status |
+|---|---|
+| Gates, checkpoints, rollback, culprit search | Tested with injected bugs on two toolchains (CMake 3.28 / clang-tidy 18 and CMake 4.4 / clang-tidy 21) |
+| R1 and R6 (deterministic) | Tested on the fixture and run on tinyxml2 and jsoncpp |
+| R2–R5 (model-written) | The loop, checks and prompts are tested with **scripted** model answers only. They have not yet been run against a real model |
+| Benchmark on leveldb | Baseline only; a full run has not been done |
+| MCP server | Tested with a scripted client over stdio. Not yet tried with a real MCP client |
+| GitHub Actions workflows | Written but never executed |
 
 ## Why it is built this way
 
@@ -141,7 +152,12 @@ back to the model for the next attempt.
 refactor-pilot bench bench/targets.json
 ```
 
-Target repos must be CMake projects, and `apply` and `run` need them to be in a git repository. Build trees go to the system temp directory unless `--work-dir` is given.
+```bash
+# Serve the navigation and verified-change tools to an MCP client (stdio)
+refactor-pilot mcp path/to/project
+```
+
+Target repos must be CMake projects, and `apply`, `run` and `mcp` need them to be in a git repository. Build trees go to the system temp directory unless `--work-dir` is given.
 
 ## The fixture
 
@@ -158,6 +174,26 @@ constructs, listed in its `manifest.json` and grouped by the recipe meant to fix
 | R6 | Dead code: stale `#ifdef`, constant flag, `#if 0`, unused function and include | 6 |
 
 It builds with two known warnings and five passing tests, on purpose: that is the baseline the tool must not make worse.
+
+## MCP server
+
+`refactor-pilot mcp <repo>` exposes seven tools to any agent that speaks the
+Model Context Protocol:
+
+| Tool | What it gives an agent |
+|---|---|
+| `find_symbol`, `references`, `outline`, `diagnostics` | Semantic navigation through `clangd` instead of text search |
+| `check_patch` | Propose a diff; get back either the branch it was committed to, or the compiler errors and failing-test output. The agent's working tree is never modified |
+| `run_recipes` | Run `std`, `r1`, `r6` on a new branch |
+| `baseline` | Build and test the repository as it stands |
+
+Register it with a client as a stdio server, for example:
+
+```json
+{"mcpServers": {"refactor-pilot": {"command": "refactor-pilot", "args": ["mcp", "/absolute/path/to/project"]}}}
+```
+
+It implements the handshake-based protocol revisions (2024-11-05 to 2025-11-25).
 
 ## LLM provider
 
@@ -200,6 +236,7 @@ src/refactor_pilot/
   textio.py        file I/O that preserves line endings and non-UTF-8 bytes
   pipeline.py      run a list of recipes on one branch and measure the result
   bench.py         benchmark over several pinned repositories, Markdown + JSON report
+  mcp_server.py    Model Context Protocol server over stdio
   checkpoint.py    private git worktree: commit, rollback, cherry-pick
   gates.py         fast gate and full gate, with feedback text for retries
   session.py       executor loop: apply -> verify -> commit or roll back; culprit search
@@ -211,10 +248,13 @@ src/refactor_pilot/
   lsp/             JSON-RPC framing, position conversion, clangd client
   navigator.py     find / outline / references / signature / callers / live diagnostics
   evalkit/         manifests and scoring
-  cli.py           baseline | check | score | symbols | refs | apply | run
+  cli.py           baseline | check | score | symbols | refs | apply | run | bench | mcp
 examples/patches/            three good and three bad patches for the fixture
 examples/replays/            recorded model answers for R2-R5 on the fixture
 bench/targets.json           benchmark targets (approved and proposed)
+.github/workflows/ci.yml     this project's own tests
+examples/github/             a workflow other projects can copy to get modernization PRs
+docs/                        one walkthrough guide per phase
 fixtures/legacy_inventory/   benchmark target
 tests/                       unit tests + end-to-end tests with injected bugs
 ```

@@ -87,3 +87,27 @@ def test_uri_roundtrip(tmp_path):
     path.parent.mkdir()
     path.write_text("")
     assert uri_to_path(path_to_uri(path)) == path.resolve()
+
+
+def test_diagnostics_for_an_older_version_of_a_file_are_ignored(tmp_path):
+    """A late report about text that has since been replaced must not be taken as current."""
+    from refactor_pilot.lsp.client import ClangdClient
+
+    client = ClangdClient(tmp_path, tmp_path)
+    uri = "file:///x/a.cpp"
+    client._versions[uri] = 2
+
+    def publish(version, line):
+        params = {"uri": uri, "diagnostics": [{"range": {"start": {"line": line, "character": 0}}, "message": "m"}]}
+        if version is not None:
+            params["version"] = version
+        client._on_notification("textDocument/publishDiagnostics", params)
+
+    publish(1, 21)  # stale: describes version 1
+    assert uri not in client._diagnostics
+    publish(2, 17)  # current
+    assert client._diagnostics[uri][0]["range"]["start"]["line"] == 17
+    publish(1, 99)  # stale again, arriving late
+    assert client._diagnostics[uri][0]["range"]["start"]["line"] == 17
+    publish(None, 5)  # a server that sends no version is believed, as before
+    assert client._diagnostics[uri][0]["range"]["start"]["line"] == 5
