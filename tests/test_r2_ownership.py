@@ -261,7 +261,8 @@ def test_unusable_answers_exhaust_attempts_and_leave_no_trace(repo, tmp_path):
 @pytest.mark.toolchain
 def test_budget_stops_the_run_and_keeps_what_was_committed(repo, tmp_path):
     result, client, _ = run_r2(repo, tmp_path, recorded("r2-fixture-api.jsonl"), budget=Budget(max_requests=1))
-    assert [o.status for o in result.outcomes] == ["committed", "rolled_back"]
+    assert [o.status for o in result.outcomes] == ["committed", "skipped"]
+    assert result.outcomes[1].reason.startswith("not finished: request budget spent")
     assert "request budget spent" in result.stopped and client.budget.requests == 1
     assert "lock_guard" in show(repo, "src/logger.cpp")  # the first target survived
     assert "FILE* file_;" in show(repo, "include/inventory/logger.h")  # the second never ran
@@ -272,3 +273,110 @@ def test_shipped_replays_are_well_formed():
         for line in (REPLAYS / name).read_text().splitlines():
             entry = json.loads(line)
             assert set(entry) == {"tag", "attempt", "response"} and entry["tag"].startswith("r2/")
+
+
+@needs_toolchain
+@pytest.mark.toolchain
+def test_continue_finishes_a_run_that_stopped_and_never_deletes_the_branch(repo, tmp_path, capsys):
+    """The model goes away after one target. --continue adds the rest to the same branch."""
+    answers = recorded("r2-fixture-api.jsonl")
+    first = tmp_path / "first.jsonl"
+    first.write_text(json.dumps({"tag": LOCK, "attempt": 1, "response": answers[LOCK][0]}) + "\n")
+    common = ["--recipe", "r2", "--allow-api-changes", "--compiler", "g++", "--no-sanitizers",
+              "--work-dir", str(tmp_path / "work"), "--manifest", str(repo / "manifest.json")]
+    head = git(repo.parent, "rev-parse", "HEAD")
+
+    assert main(["run", str(repo), *common, "--branch", "rp/r2", "--replay", str(first)]) == 0
+    out = capsys.readouterr().out
+    assert "1 committed, 0 rolled back, 0 reverted, 0 unchanged, 1 skipped" in out
+    assert "reason: not finished: no recorded response" in out  # an outage, not a verdict on any edit
+    assert "to finish later, run the same command with --continue rp/r2" in out
+    after_first = git(repo.parent, "rev-parse", "rp/r2")
+
+    full = tmp_path / "full.jsonl"
+    full.write_text((REPLAYS / "r2-fixture-api.jsonl").read_text())
+    assert main(["run", str(repo), *common, "--continue", "rp/r2", "--replay", str(full)]) == 0
+    out = capsys.readouterr().out
+    assert "continuing branch rp/r2" in out
+    assert "3 committed, 0 rolled back" in out and "R2: 1/8 -> 8/8" in out  # the lock target is not redone
+    subjects = git(repo.parent, "log", "--reverse", "--format=%s", f"{head}..rp/r2").splitlines()
+    assert [s.split(": ")[0] for s in subjects] == [LOCK, FILEH, WAREHOUSE, FACTORY]
+    assert git(repo.parent, "rev-parse", "HEAD") == head and git(repo.parent, "status", "--porcelain") == ""
+
+    # Continuing again finds nothing left to do. The branch must survive that.
+    tip = git(repo.parent, "rev-parse", "rp/r2")
+    assert main(["run", str(repo), *common, "--continue", "rp/r2", "--replay", str(full)]) == 0
+    assert "nothing new was committed; branch 'rp/r2' is unchanged." in capsys.readouterr().out
+    assert git(repo.parent, "rev-parse", "rp/r2") == tip != after_first
+
+
+def test_continue_refuses_what_it_cannot_do_safely(repo, tmp_path, capsys):
+    from refactor_pilot.checkpoint import CheckpointError, Workspace
+
+    with pytest.raises(CheckpointError, match="no branch named 'nope'"):
+        Workspace.create(repo, tmp_path / "w", continue_branch="nope")
+    current = git(repo.parent, "rev-parse", "--abbrev-ref", "HEAD")
+    with pytest.raises(CheckpointError, match="checked out somewhere else"):
+        Workspace.create(repo, tmp_path / "w", continue_branch=current)
+    assert main(["run", str(repo), "--recipe", "r1", "--branch", "a", "--continue", "b"]) == 2
+    assert "either --branch" in capsys.readouterr().err
+
+
+@needs_toolchain
+@pytest.mark.toolchain
+def test_overloaded_primary_model_reproduces_the_first_live_run_and_now_finishes(repo, tmp_path, capsys, monkeypatch):
+    """A local stand-in for the Gemini endpoint. The preferred model answers once, then
+    returns the 503 'high demand' error seen in the first live run, for good. The
+    fallback model answers everything after that."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    answers = recorded("r2-fixture-api.jsonl")
+    by_goal = {"manual `lock()`": answers[LOCK][0], "`FILE*` through RAII": answers[FILEH][0],
+               "explicit in `inventory::Warehouse`": answers[WAREHOUSE][0],
+               "explicit in `inventory::create_item`": answers[FACTORY][0]}
+    overloaded = [{"error": {"code": 503, "status": "UNAVAILABLE",
+                             "message": "This model is currently experiencing high demand. Spikes in demand are "
+                                        "usually temporary. Please try again later."}}]
+    served = []
+
+    class Gemini(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            model, prompt = body["model"], body["messages"][1]["content"]
+            served.append(model)
+            if model == "gemini-3.8-flash" and served.count("gemini-3.8-flash") > 1:
+                status, payload = 503, overloaded
+            else:
+                text = next(answer for goal, answer in by_goal.items() if goal in prompt)
+                status, payload = 200, {"choices": [{"message": {"role": "assistant", "content": text}}],
+                                        "usage": {"prompt_tokens": 1000, "completion_tokens": 300}}
+            data = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Gemini)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("REFACTOR_PILOT_BASE_URL", f"http://127.0.0.1:{server.server_port}/v1beta/openai/")
+    monkeypatch.setenv("REFACTOR_PILOT_API_KEY", "test-key")
+    monkeypatch.setenv("REFACTOR_PILOT_RPM", "0")
+    monkeypatch.delenv("REFACTOR_PILOT_MODEL", raising=False)  # the shipped default: 3.8 Flash, then 3.5 Flash-Lite
+    record = tmp_path / "live.jsonl"
+
+    code = main(["run", str(repo), "--recipe", "r2", "--allow-api-changes", "--compiler", "g++", "--no-sanitizers",
+                 "--branch", "rp/r2", "--work-dir", str(tmp_path / "work"), "--record", str(record),
+                 "--manifest", str(repo / "manifest.json")])
+    out = capsys.readouterr().out
+    server.shutdown()
+    assert code == 0
+    assert "model: gemini-3.8-flash (then gemini-3.5-flash-lite)" in out
+    assert "answered by fallback model gemini-3.5-flash-lite" in out
+    assert "4 committed, 0 rolled back" in out and "R2: 0/8 -> 8/8" in out
+    assert "model usage: 4 requests" in out  # the refused requests cost nothing
+    models = [json.loads(line)["model"] for line in record.read_text().splitlines()]
+    assert models == ["gemini-3.8-flash"] + ["gemini-3.5-flash-lite"] * 3

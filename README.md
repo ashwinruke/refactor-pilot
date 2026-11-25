@@ -3,7 +3,7 @@
 An LSP-powered agent that modernizes legacy C++ (C++11/14 → C++20) in small,
 verified, reversible change-sets, and delivers the result as a reviewable branch.
 
-**Status:** Seven recipes, a benchmark, and an MCP server.
+**Status: all eight planned phases are built (version 0.8.1).** Seven recipes, a benchmark, and an MCP server.
 On the bundled fixture the full pipeline resolves **32 of 32** planted legacy constructs in 43 verified commits.
 Read [What has been verified](#what-has-been-verified) before relying on any of it.
 
@@ -201,16 +201,24 @@ Recipes R2–R5 use a model. It talks to any **OpenAI-compatible chat-completion
 endpoint**, so the provider is configuration, not code:
 
 ```bash
-export REFACTOR_PILOT_API_KEY="..."                       # required
-export REFACTOR_PILOT_MODEL="gemini-3.8-flash"            # default
+export REFACTOR_PILOT_API_KEY="..."                                   # required
+export REFACTOR_PILOT_MODEL="gemini-3.8-flash,gemini-3.5-flash-lite"  # default: preferred first, then fallbacks
 export REFACTOR_PILOT_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"   # default
-export REFACTOR_PILOT_RPM="10"                            # requests per minute, default 10
+export REFACTOR_PILOT_RPM="10"                                        # requests per minute, default 10
+export REFACTOR_PILOT_MAX_WAIT="300"                                  # seconds to ride out an outage, default 300
 ```
 
 The defaults target the **free tier of the Google Gemini API**. Groq, OpenRouter
-or a local server work by changing the three variables. Free tiers are
-rate-limited and change often, so the client throttles itself, backs off on HTTP
-429, and stops at a hard request budget (`--max-requests`, default 40).
+or a local server work by changing the variables.
+
+Free tiers fail in ordinary ways, and the client is built for them:
+
+- **A model is overloaded (HTTP 503).** The next model in `REFACTOR_PILOT_MODEL` is tried at once.
+- **A daily quota is spent (HTTP 429).** That model is set aside for the rest of the run. Gemini 3.8 Flash has a small free daily quota, which is why 3.5 Flash-Lite is the default fallback.
+- **Everything is failing.** The client waits (5, 10, 20, 40, 60 … seconds, or what the server's `Retry-After` says) for up to `REFACTOR_PILOT_MAX_WAIT`, logging each wait.
+- **Still failing after that.** The run stops cleanly. Unfinished targets are marked `skipped`, not `rolled_back`, because nothing was judged. Finish later with `--continue BRANCH`, which adds to the same branch and does not redo finished targets.
+
+Only answered requests count against `--max-requests`.
 
 **A stronger model is expected to give better results.** The model writes only
 the judgement-heavy edits, and every edit must pass the same checks and gates; a

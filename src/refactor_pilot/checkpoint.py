@@ -36,6 +36,7 @@ class Workspace:
     worktree: Path  # root of our private checkout
     branch: str
     base_sha: str
+    created_branch: bool = True  # False when continuing a branch that already existed
 
     @property
     def repo(self) -> Path:
@@ -43,7 +44,9 @@ class Workspace:
         return self.worktree / self.prefix
 
     @classmethod
-    def create(cls, repo: Path, work_dir: Path, branch: str | None = None, allow_dirty: bool = False) -> "Workspace":
+    def create(cls, repo: Path, work_dir: Path, branch: str | None = None, allow_dirty: bool = False,
+               continue_branch: str | None = None) -> "Workspace":
+        """Make a private checkout on a new branch from HEAD, or on an existing branch to add to it."""
         require("git")
         source = Path(repo).resolve()
         top = run(["git", "-C", source, "rev-parse", "--show-toplevel"])
@@ -53,6 +56,8 @@ class Workspace:
         prefix = source.relative_to(toplevel)
         if not _git(toplevel, "rev-parse", "--verify", "HEAD", check=False).ok:
             raise CheckpointError("the repository has no commits yet; commit first")
+        if continue_branch:
+            return cls._continue(source, toplevel, prefix, Path(work_dir), continue_branch)
         dirty = _git(toplevel, "status", "--porcelain", "--", str(prefix)).output.strip()
         if dirty and not allow_dirty:
             raise CheckpointError(
@@ -68,6 +73,34 @@ class Workspace:
         _git(toplevel, "worktree", "add", "-b", branch, str(worktree), "HEAD")
         base = _git(worktree, "rev-parse", "HEAD").output.strip()
         return cls(source, toplevel, prefix, worktree, branch, base)
+
+    @classmethod
+    def _continue(cls, source: Path, toplevel: Path, prefix: Path, work_dir: Path, branch: str) -> "Workspace":
+        """Check out an existing branch, so new commits are added to it.
+
+        Your working tree is not involved, so uncommitted changes there do not
+        matter. The branch must not be checked out anywhere else.
+        """
+        if not _git(toplevel, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False).ok:
+            raise CheckpointError(f"there is no branch named '{branch}' to continue")
+        if not _git(toplevel, "cat-file", "-e", f"{branch}:{prefix.as_posix()}" if str(prefix) != "." else branch,
+                    check=False).ok:
+            raise CheckpointError(f"branch '{branch}' does not contain {prefix.as_posix()}")
+        worktree = work_dir.resolve() / ("worktree-" + branch.replace("/", "-"))
+        if worktree.exists():
+            _git(toplevel, "worktree", "prune", check=False)
+            if worktree.exists():
+                raise CheckpointError(f"{worktree} already exists (an interrupted run?). Delete it, then run "
+                                      "'git worktree prune', then try again")
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        added = _git(toplevel, "worktree", "add", str(worktree), branch, check=False)
+        if not added.ok:
+            if "already" in added.output and ("checked out" in added.output or "used by worktree" in added.output):
+                raise CheckpointError(f"branch '{branch}' is checked out somewhere else (perhaps in your own "
+                                      "working tree). Switch that checkout to another branch, then try again")
+            raise CheckpointError(f"could not check out '{branch}': {added.output.strip()[-300:]}")
+        base = _git(worktree, "rev-parse", "HEAD").output.strip()
+        return cls(source, toplevel, prefix, worktree, branch, base, created_branch=False)
 
     # ---- safety ----------------------------------------------------------
 
@@ -158,5 +191,5 @@ class Workspace:
         _git(self.toplevel, "worktree", "remove", "--force", str(self.worktree), check=False)
         shutil.rmtree(self.worktree, ignore_errors=True)
         _git(self.toplevel, "worktree", "prune", check=False)
-        if delete_branch:
+        if delete_branch and self.created_branch:  # never delete a branch this run did not create
             _git(self.toplevel, "branch", "-D", self.branch, check=False)

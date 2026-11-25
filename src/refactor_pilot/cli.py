@@ -153,7 +153,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     return 0 if _print_report(session.report) == len(session.report.outcomes) else 1
 
 
-def _print_report(report, show_unchanged: bool = True) -> int:
+def _print_report(report, show_unchanged: bool = True, continued: bool = False) -> int:
     """Print one line per change-set and the summary. Returns the number committed."""
     print()
     for outcome in report.outcomes:
@@ -174,6 +174,8 @@ def _print_report(report, show_unchanged: bool = True) -> int:
         print(f"  review:  git log --oneline {report.base_sha[:8]}..{report.branch}")
         print(f"  diff:    git diff {report.base_sha[:8]} {report.branch}")
         print(f"  accept:  git merge {report.branch}")
+    elif continued:
+        print(f"nothing new was committed; branch '{report.branch}' is unchanged.")
     else:
         print("nothing was committed; no branch was left behind.")
     return kept
@@ -209,6 +211,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     if recipes is None:
         return 2
     model_recipes = [r for r in recipes if r in pipeline.LLM_RECIPES]
+    if args.continue_branch and args.branch:
+        print("error: use either --branch (start a new branch) or --continue (add to an existing one)", file=sys.stderr)
+        return 2
     log = lambda message: print(f"  {message}", flush=True)  # noqa: E731
     if args.plan:
         session = Session(args.repo, work_dir=args.work_dir, compiler=args.compiler, branch=args.branch,
@@ -224,19 +229,23 @@ def cmd_run(args: argparse.Namespace) -> int:
         checks=[c.strip() for c in args.checks.split(",") if c.strip()] if args.checks else None,
         flags=_parse_flags(args.flag), allow_api_changes=args.allow_api_changes, std=args.std,
         max_attempts=args.max_attempts, manifest=args.manifest, cmake_args=args.cmake_arg,
-        measure_tidy="r1" in recipes,
+        measure_tidy="r1" in recipes, continue_branch=args.continue_branch,
     )
 
     def on_start(session: Session) -> None:
-        print(f"branch {session.workspace.branch} (private worktree: {session.workspace.worktree})")
+        verb = "continuing branch" if args.continue_branch else "branch"
+        print(f"{verb} {session.workspace.branch} (private worktree: {session.workspace.worktree})")
         if isinstance(client, ReplayClient):
             print(f"  model: replaying {args.replay} (no network, no key)")
         elif client is not None:
             inner = client.inner if isinstance(client, RecordingClient) else client
-            print(f"  model: {inner.model} via {inner.base_url}; budget {inner.budget.max_requests} requests")
+            inner.log = log
+            fallback = f" (then {', '.join(inner.models[1:])})" if len(inner.models) > 1 else ""
+            print(f"  model: {inner.models[0]}{fallback} via {inner.base_url}; "
+                  f"budget {inner.budget.max_requests} requests")
 
     result = pipeline.run_pipeline(opts, client, log=log, on_start=on_start)
-    _print_report(result.report, show_unchanged=args.verbose or recipes != ["r1"])
+    _print_report(result.report, show_unchanged=args.verbose or recipes != ["r1"], continued=bool(args.continue_branch))
     print()
     if "r1" in recipes:
         print(f"clang-tidy modernize findings: {sum(result.tidy_before.values())} -> {sum(result.tidy_after.values())}")
@@ -244,6 +253,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"model usage: {result.requests} requests, {result.tokens} tokens")
     if result.stopped:
         print(f"stopped early: {result.stopped}")
+        if result.report.count("committed") or args.continue_branch:
+            print(f"to finish later, run the same command with --continue {result.report.branch} "
+                  "(without --branch); finished targets are not redone")
     for note in result.notes:
         print(note)
     if result.score_after is not None:
@@ -388,6 +400,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-attempts", type=int, default=3, help="r2-r5: attempts per target before giving up")
     p.add_argument("--manifest", type=Path, default=None, help="benchmark manifest; prints the score before and after")
     p.add_argument("--branch", default=None)
+    p.add_argument("--continue", dest="continue_branch", default=None, metavar="BRANCH",
+                   help="add to an existing branch, e.g. one from a run that stopped early")
     p.add_argument("--full-every", type=int, default=5)
     p.add_argument("--work-dir", type=Path, default=None)
     p.add_argument("--compiler", default="clang++")

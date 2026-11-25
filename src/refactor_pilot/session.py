@@ -99,10 +99,12 @@ class Session:
         log: Callable[[str], None] = lambda message: None,
         cmake_args: list[str] | None = None,
         test_timeout: int = 120,
+        continue_branch: str | None = None,
     ):
         self._source_cfg = BuildConfig(repo=repo, work_dir=work_dir, compiler=compiler,
                                        cmake_args=list(cmake_args or []), test_timeout=test_timeout)
         self._branch, self._sanitizers = branch, sanitizers
+        self._continue_branch = continue_branch
         self.full_every, self.max_attempts = max(1, full_every), max(1, max_attempts)
         self._allow_dirty, self._keep_worktree, self._log = allow_dirty, keep_worktree, log
         self.workspace: Workspace | None = None
@@ -130,7 +132,8 @@ class Session:
     def start(self) -> "Session":
         self._started = time.monotonic()
         work = self._source_cfg.work_dir
-        self.workspace = Workspace.create(self._source_cfg.repo, work, self._branch, self._allow_dirty)
+        self.workspace = Workspace.create(self._source_cfg.repo, work, self._branch, self._allow_dirty,
+                                          continue_branch=self._continue_branch)
         try:
             cfg = BuildConfig(
                 repo=self.workspace.repo,
@@ -185,7 +188,10 @@ class Session:
             except Exception as exc:  # a broken edit must never take the session down
                 ws.rollback()
                 outcome.reason = f"could not apply: {exc}".splitlines()[0][:300]
-                if getattr(exc, "fatal", False):  # e.g. budget spent: stop the whole recipe
+                if getattr(exc, "fatal", False):  # budget spent, model unavailable: stop the whole recipe
+                    # Not a verdict on the change: it was never finished. Say so.
+                    outcome.status = "skipped"
+                    outcome.reason = "not finished: " + " ".join(str(exc).split())[:280]
                     outcome.seconds = time.monotonic() - start
                     self._log(f"{outcome.status:<11} {change.id}  ({outcome.reason})")
                     raise

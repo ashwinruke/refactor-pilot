@@ -66,6 +66,7 @@ class PipelineOptions:
     test_timeout: int = 120
     measure_tidy: bool = True
     discard_branch: bool = False  # delete the result branch after measuring (benchmarks)
+    continue_branch: str | None = None  # add to this existing branch instead of making a new one
 
 
 @dataclass
@@ -105,6 +106,7 @@ def run_pipeline(
     session = Session(
         opts.repo, work_dir=opts.work_dir, compiler=opts.compiler, branch=opts.branch,
         sanitizers=opts.sanitizers, full_every=opts.full_every, allow_dirty=opts.allow_dirty,
+        continue_branch=opts.continue_branch,
         keep_worktree=opts.keep_worktree, log=log, cmake_args=opts.cmake_args, test_timeout=opts.test_timeout,
     )
     notes: list[str] = []
